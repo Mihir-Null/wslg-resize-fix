@@ -1,3 +1,10 @@
+> **STATUS 2026-10-08 04:16 — DO NOT `apply` YET.** The patched rdprail-shell.so built here segfaults in the live
+> session (NULL+0x28 inside libwayland-server, ~80 ms after start, before msrdc reconnect completes);
+> WSLGd gave up relaunching Weston. It does *not* crash in a chroot harness without a live msrdc/shared-memory
+> session, so the crash is environment-dependent (likely RDP peer activation path or an ABI detail not caught
+> by the symbol-import check). Recovery: `wsl --shutdown` (or terminate the distro) restores stock WSLg.
+> The Windows helper alone is safe and verified (position sync works; size needs the shell patch).
+
 # wslg-resize-fix
 
 Make WSLg windows follow move/resize done by external Windows window managers

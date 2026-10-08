@@ -51,6 +51,7 @@ restart_weston() {
 case "$ACTION" in
   status) status ;;
   apply)
+    [ "${FORCE_APPLY:-0}" = 1 ] || { echo "!! patched module currently crashes Weston (see README STATUS); set FORCE_APPLY=1 to override" >&2; exit 1; }
     if [ -z "$SRC" ]; then
       for c in /tmp/wslg-out/rdprail-shell.so "$HERE/out/rdprail-shell.so"; do [ -f "$c" ] && { SRC="$c"; break; }; done
     fi
