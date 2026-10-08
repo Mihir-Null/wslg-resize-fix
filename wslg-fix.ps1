@@ -8,6 +8,7 @@
   build-modules  only the Linux side (or, in a Nix distro: nix run <repo>)
   build-helper   only the Windows helper (needs cargo)
   install        install what 'build' produced, point WSLg at it (%USERPROFILE%\.wslgconfig),
+                 drop the shadow margin around X11 window frames (-KeepShadow leaves it),
                  register + start the helper logon task. Takes effect at the next WSL start.
   uninstall      undo 'install' (-Purge also deletes installed files once WSL is shut down)
   status         what is installed, which WSLg is running, what its Weston loaded
@@ -28,7 +29,8 @@ param(
   [string]$Distro,     # distro whose WSLg is used for building/status (default: the one holding this repo, else WSL's default)
   [switch]$Trace,      # start: helper logs every WinEvent
   [switch]$Purge,      # uninstall: also delete installed modules/helper
-  [switch]$Force       # install: replace changed files even while WSL is running
+  [switch]$Force,      # install: replace changed files even while WSL is running
+  [switch]$KeepShadow  # install: keep the 32 px shadow margin around X11 window frames
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
@@ -43,6 +45,13 @@ $Cfg = Join-Path $env:USERPROFILE '.wslgconfig'   # WSLGd reads this (WSL2_USER_
 $TaskName = 'wslg-resize-sync'
 $CfgSection = 'system-distro-env'
 $CfgKey = 'WESTON_MODULE_MAP'
+$Shims = @('rdp-backend.so', 'rdprail-shell.so', 'xwayland.so')   # module names WESTON_MODULE_MAP redirects
+# Weston's X11 window manager draws each frame inside a 32 px transparent
+# shadow margin, which WSLg sends to Windows as part of the window, so a tiling
+# WM sizes the shadow and the visible frame sits 32 px inside its tile. The
+# patched xwayland.so (patches/0003) reads this; 0 means no shadow margin.
+$ShadowKey = 'WESTON_XWM_SHADOW_MARGIN'
+$ShadowValue = '0'
 $CfgComment = '; added by wslg-resize-fix (wslg-fix.ps1 uninstall removes it)'
 
 # Where is the repo, as seen from inside WSL?
@@ -86,36 +95,43 @@ function Read-Cfg {
   if ($t.Length -and $t[0] -eq [char]0xFEFF) { $t = $t.Substring(1) }
   @($t -split "`r?`n")
 }
-function Get-CfgValue {
-  $sec = $null
+function Get-CfgEntry([string]$Key) {   # @{ Value; Ours } (Ours: our comment is right above it), or $null
+  $sec = $null; $prev = $null
   foreach ($l in Read-Cfg) {
-    if ($l -match '^\[([^\]]+)\]') { $sec = $Matches[1]; continue }
-    if ($sec -eq $CfgSection -and $l -match "^$CfgKey\s*=\s*(.*)$") { return $Matches[1].Trim() }
+    if ($l -match '^\[([^\]]+)\]') { $sec = $Matches[1]; $prev = $l; continue }
+    if ($sec -eq $CfgSection -and $l -match "^$Key\s*=\s*(.*)$") {
+      return @{ Value = $Matches[1].Trim(); Ours = ($prev -eq $CfgComment) }
+    }
+    $prev = $l
   }
   $null
 }
-function Set-CfgValue([string]$Value) {   # $null removes our key (and comment, and the section if left empty)
+function Get-CfgValue([string]$Key = $CfgKey) { $e = Get-CfgEntry $Key; if ($e) { $e.Value } else { $null } }
+function Set-CfgValue([string]$Value, [string]$Key = $CfgKey) {   # $null removes the key (and our comment, and the section if left empty)
   $out = [Collections.Generic.List[string]]::new()
   $sec = $null; $done = $false
-  foreach ($l in Read-Cfg) {
+  $lines = @(Read-Cfg)
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    $l = $lines[$i]
     if ($l -match '^\[([^\]]+)\]') {
-      if ($sec -eq $CfgSection -and $Value -and -not $done) { $out.Add($CfgComment); $out.Add("$CfgKey=$Value"); $done = $true }
+      if ($sec -eq $CfgSection -and $Value -and -not $done) { $out.Add($CfgComment); $out.Add("$Key=$Value"); $done = $true }
       $sec = $Matches[1]; $out.Add($l); continue
     }
-    if ($l -eq $CfgComment) { continue }
-    if ($sec -eq $CfgSection -and $l -match "^$CfgKey\s*=") {
-      if ($Value -and -not $done) { $out.Add($CfgComment); $out.Add("$CfgKey=$Value"); $done = $true }
+    # our comment belongs to the key on the next line; it is re-added with it
+    if ($l -eq $CfgComment -and $i + 1 -lt $lines.Count -and $lines[$i + 1] -match "^$Key\s*=") { continue }
+    if ($sec -eq $CfgSection -and $l -match "^$Key\s*=") {
+      if ($Value -and -not $done) { $out.Add($CfgComment); $out.Add("$Key=$Value"); $done = $true }
       continue
     }
     $out.Add($l)
   }
   if ($Value -and -not $done) {
+    while ($out.Count -and $out[$out.Count - 1] -eq '') { $out.RemoveAt($out.Count - 1) }
     if ($sec -ne $CfgSection) {
-      while ($out.Count -and $out[$out.Count - 1] -eq '') { $out.RemoveAt($out.Count - 1) }
       if ($out.Count) { $out.Add('') }
       $out.Add("[$CfgSection]")
     }
-    $out.Add($CfgComment); $out.Add("$CfgKey=$Value")
+    $out.Add($CfgComment); $out.Add("$Key=$Value")
   }
   # Drop our section if it is now empty (header followed only by blanks/other sections).
   $clean = [Collections.Generic.List[string]]::new()
@@ -158,7 +174,7 @@ function Build-Modules {
   New-Item -ItemType Directory -Force $Dist | Out-Null
   $distWsl = To-Wsl $Dist
   # Replace only module outputs: dist\bin holds the helper from build-helper.
-  Sys "mkdir -p '$distWsl' && rm -rf '$distWsl'/weston-* '$distWsl'/rdp-backend.so '$distWsl'/rdprail-shell.so && cp -r /tmp/wslg-out/. '$distWsl'/"
+  Sys "mkdir -p '$distWsl' && rm -rf '$distWsl'/weston-* '$distWsl'/rdp-backend.so '$distWsl'/rdprail-shell.so '$distWsl'/xwayland.so && cp -r /tmp/wslg-out/. '$distWsl'/"
   Write-Host "== modules -> $Dist"
 }
 
@@ -191,7 +207,7 @@ function Start-Helper {
 
 # --- install / uninstall -----------------------------------------------------------------
 function Install-Fix {
-  foreach ($f in 'rdp-backend.so', 'rdprail-shell.so', 'bin\wslg-resize-syncw.exe') {
+  foreach ($f in @($Shims) + 'bin\wslg-resize-syncw.exe') {
     if (-not (Test-Path (Join-Path $Dist $f))) { throw "missing $Dist\${f}: run .\wslg-fix.ps1 build first" }
   }
   $mods = @(Get-ChildItem $Dist -Directory -Filter 'weston-*')
@@ -201,7 +217,7 @@ function Install-Fix {
   # could crash WSLg. New files are fine at any time; changed ones need WSL shut down.
   $running = Wsl-Running
   $copies = @()
-  foreach ($f in @('rdp-backend.so', 'rdprail-shell.so') + @($mods | ForEach-Object { Get-ChildItem $_.FullName -File | ForEach-Object { "$($_.Directory.Name)\$($_.Name)" } })) {
+  foreach ($f in @($Shims) + @($mods | ForEach-Object { Get-ChildItem $_.FullName -File | ForEach-Object { "$($_.Directory.Name)\$($_.Name)" } })) {
     $src = Join-Path $Dist $f; $dst = Join-Path $Inst $f
     if (Same-File $src $dst) { continue }
     if ((Test-Path $dst) -and $running -and -not $Force) {
@@ -226,12 +242,21 @@ function Install-Fix {
   Copy-Item (Join-Path $Dist 'bin\*.exe') $Bin -Force
 
   $l = To-Wsl $Inst
-  $map = "rdp-backend.so=$l/rdp-backend.so;rdprail-shell.so=$l/rdprail-shell.so"
+  $map = ($Shims | ForEach-Object { "$_=$l/$_" }) -join ';'
   $cur = Get-CfgValue
   if ($cur -and $cur -ne $map -and $cur -notmatch 'wslg-resize-fix') {
     throw "$Cfg already sets $CfgKey=$cur (not ours); refusing to overwrite it"
   }
   if ($cur -ne $map) { Set-CfgValue $map; Write-Host "== $Cfg [$CfgSection] $CfgKey=$map" }
+  $sh = Get-CfgEntry $ShadowKey
+  if ($KeepShadow) {
+    if ($sh -and $sh.Ours) { Set-CfgValue $null $ShadowKey; Write-Host "== removed $ShadowKey from $Cfg (-KeepShadow)" }
+  } elseif (-not $sh) {
+    Set-CfgValue $ShadowValue $ShadowKey
+    Write-Host "== $Cfg [$CfgSection] $ShadowKey=$ShadowValue (no shadow margin around X11 window frames)"
+  } elseif (-not $sh.Ours) {
+    Write-Host "   $ShadowKey=$($sh.Value) is already set in $Cfg; left alone"
+  }
 
   $action = New-ScheduledTaskAction -Execute (Join-Path $Bin 'wslg-resize-syncw.exe') -Argument "--log `"$Log`""
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
@@ -258,6 +283,8 @@ function Uninstall-Fix {
   $cur = Get-CfgValue
   if ($cur -and $cur -match 'wslg-resize-fix') { Set-CfgValue $null; Write-Host "== removed $CfgKey from $Cfg" }
   elseif ($cur) { Write-Warning "$Cfg sets $CfgKey=$cur, which is not ours; left alone" }
+  $sh = Get-CfgEntry $ShadowKey
+  if ($sh -and $sh.Ours) { Set-CfgValue $null $ShadowKey; Write-Host "== removed $ShadowKey from $Cfg" }
   if ($Purge) {
     if (Wsl-Running) {
       Write-Warning "WSL is running and its Weston may still use the installed shims: run 'wsl --shutdown', then '.\wslg-fix.ps1 uninstall -Purge' again."
@@ -274,6 +301,9 @@ function Show-Status {
   Write-Host "WSLg:       $wslg (weston $commit)$(if ($Distro) { ", distro $Distro" })"
   $cur = Get-CfgValue
   Write-Host ("config:     " + $(if ($cur) { "$CfgKey=$cur" } else { "no $CfgKey in $Cfg (not installed)" }))
+  $sh = Get-CfgEntry $ShadowKey
+  $shLive = "$(SysOut 'grep -ho "XWM: frame shadow margin [0-9]* px" /mnt/wslg/weston.log 2>/dev/null | tail -1')".Trim()
+  Write-Host ("shadows:    " + $(if ($sh) { "$ShadowKey=$($sh.Value)$(if (-not $sh.Ours) { ' (set by you)' })" } else { 'default (32 px shadow margin around X11 frames)' }) + $(if ($shLive) { "; running Weston: $shLive" }))
   $have = @(Get-ChildItem $Inst -Directory -Filter 'weston-*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name.Substring(7, 12) })
   Write-Host ("installed:  " + $(if ($have) { ($have -join ', ') + $(if ($have -contains $commit.Substring(0, 12)) { '  (matches running WSLg)' } else { '  (NONE for the running WSLg: rebuild)' }) } else { 'no modules' }))
   $loaded = SysOut 'grep -h "wslg-resize-fix:" /mnt/wslg/weston.log 2>/dev/null | tail -2'

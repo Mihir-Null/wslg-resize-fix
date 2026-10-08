@@ -47,12 +47,13 @@ lives in Weston (`rdp-backend` + `rdprail-shell`) inside the WSLg system distro.
 |---|---|---|
 | [`patches/0001`](patches/0001-rdprail-shell-honor-client-window-move-size.patch) | `rdprail-shell.so` | implement the TODO: same size conversion and min/max clamp as the snap path; skip maximized/fullscreen; apply the new position together with the resized buffer (250 ms fallback) so msrdc never sees "new position, old size" (proposed upstream as-is) |
 | [`patches/0002`](patches/0002-rdp-backend-window-control-fifo.patch) | `rdp-backend.so` | control FIFO `$XDG_RUNTIME_DIR/wslg-window-ctl`; each `move <id-hex> <l> <t> <r> <b>` line goes to the **unmodified** Client Window Move handler |
-| [`shim/shim.c`](shim/shim.c) | both | loaded in place of the stock modules; picks `weston-<commit>/<module>` for the running WSLg, **else the stock module** |
+| [`patches/0003`](patches/0003-xwayland-configurable-frame-shadow-margin.patch) | `xwayland.so` | `WESTON_XWM_SHADOW_MARGIN`: the transparent shadow margin around X11 window frames (default 32 px); `install` sets 0, so a tiled X11 window fills its tile instead of sitting 32 px inside it (see [Window shadows](#window-shadows)) |
+| [`shim/shim.c`](shim/shim.c) | all three | loaded in place of the stock modules; picks `weston-<commit>/<module>` for the running WSLg, **else the stock module** |
 | [`helper/`](helper/src/app.rs) | Windows | watches msrdc's windows; when something other than msrdc/Weston moved one, writes its rect to that distro's FIFO |
 
 Patch 0001 is useful on its own (it fixes keyboard resizing). 0002 + helper
 work around msrdc not reporting external moves; they become unnecessary if msrdc
-is fixed.
+is fixed. 0003 is independent of both: it only changes how X11 frames are drawn.
 
 ## Install (Windows, no admin rights needed)
 
@@ -73,16 +74,20 @@ wsl --shutdown             # WSLg picks it up at the next start (closes all WSL 
 
 1. copies the shims and `weston-<commit>\` builds to `%LOCALAPPDATA%\wslg-resize-fix\modules`
    and the helper to `…\bin`;
-2. adds one line to `%USERPROFILE%\.wslgconfig`, which WSLGd reads at start and
-   exports to Weston:
+2. adds two settings to `%USERPROFILE%\.wslgconfig`, which WSLGd reads at start
+   and exports to Weston:
    ```ini
    [system-distro-env]
    ; added by wslg-resize-fix (wslg-fix.ps1 uninstall removes it)
-   WESTON_MODULE_MAP=rdp-backend.so=/mnt/c/Users/<you>/AppData/Local/wslg-resize-fix/modules/rdp-backend.so;rdprail-shell.so=…/rdprail-shell.so
+   WESTON_MODULE_MAP=rdp-backend.so=/mnt/c/Users/<you>/AppData/Local/wslg-resize-fix/modules/rdp-backend.so;rdprail-shell.so=…/rdprail-shell.so;xwayland.so=…/xwayland.so
+   ; added by wslg-resize-fix (wslg-fix.ps1 uninstall removes it)
+   WESTON_XWM_SHADOW_MARGIN=0
    ```
    `WESTON_MODULE_MAP` is libweston's own module-path override; WSLGd hard-codes
-   `--backend=rdp-backend.so --shell=rdprail-shell.so`, and the map redirects
-   those names to the shims;
+   `--backend=rdp-backend.so --shell=rdprail-shell.so` and libweston loads
+   `xwayland.so` by name, and the map redirects those names to the shims.
+   `WESTON_XWM_SHADOW_MARGIN=0` is read by patch 0003 (stock modules ignore it);
+   `install -KeepShadow` leaves it out, and a value you set yourself is left alone;
 3. registers a per-user logon task running the windowless helper
    (`wslg-resize-syncw.exe --log %LOCALAPPDATA%\wslg-resize-fix\wslg-resize-sync.log`).
 
@@ -117,6 +122,8 @@ is installed.)
 .\wslg-fix.ps1 uninstall; wsl --shutdown; .\wslg-fix.ps1 uninstall -Purge   # -Purge deletes the files
 ```
 
+`uninstall` removes both settings (only the ones it added).
+
 If WSLg ever fails to start, removing the `WESTON_MODULE_MAP` line from
 `%USERPROFILE%\.wslgconfig` and running `wsl --shutdown` restores stock WSLg.
 `WSLG_RESIZE_FIX_DISABLE=1` in the same section makes the shims load the stock
@@ -134,7 +141,7 @@ opens it `O_RDWR` (never sees EOF) and reuses an existing FIFO across restarts.
 **Why shims.** A module built for one weston commit loaded into another would
 crash Weston (WSLg's internal structs change between releases). The shims have
 no libweston dependency, export only the entry point
-(`weston_backend_init` / `wet_shell_init`), read `/mnt/wslg/versions.txt`, and
+(`weston_backend_init` / `wet_shell_init` / `weston_module_init`), read `/mnt/wslg/versions.txt`, and
 forward to the matching build or to the stock module. Messages go to
 `weston.log` via `weston_log`.
 
@@ -161,6 +168,32 @@ An earlier version made msrdc send the PDU itself by posting `SC_MOVE` + →, �
 It worked, but the move loop activated the window (focus steal), and WMs saw
 `EVENT_SYSTEM_MOVESIZESTART/END` and reacted (LeopardWM treated it as a user
 resize-snap). The FIFO replaced that.
+
+### Window shadows
+
+Weston's X11 window manager draws each frame inside a 32 px transparent margin
+for its drop shadow, and the surface includes that margin. By default the RDP
+backend sends the whole surface to Windows as the window. msrdc's windows are
+layered (per-pixel alpha) with no window region, and `DWMWA_EXTENDED_FRAME_BOUNDS`
+equals the window rect, so a tiling WM can't see the margin: it sizes the shadow,
+and the visible frame sits 32 px inside its tile on every side.
+
+Patch 0003 makes the margin configurable (`WESTON_XWM_SHADOW_MARGIN`, pixels);
+with 0 the frame is the whole surface, so the Windows window is exactly the
+visible frame and a tiled X11 window fills its tile (measured on a LeopardWM tile:
+31 px gap before, none after). Mouse resizing moves onto the frame itself:
+Weston's 8 px resize grip, which used to lie in the shadow, now starts at the
+frame edge (the 6 px border and the top of the title bar). Nothing else changes: the backend keeps its
+default shadow handling, and window moves see the same sizes as before.
+
+WSLg also has `WESTON_RDP_WINDOW_SHADOW_REMOTING=false`, which clips the shadow in
+the backend and leaves an 8 px resize border instead. It is not used here: on a
+two-monitor layout whose secondary monitor is above-left of the primary
+(client desktop origin −2560,−1600) a Client Window Move for a 670×683 window
+reached the shell as 5790×3883 in that mode, and windows grew without bound.
+
+Wayland clients that draw their own decorations (GTK with client-side
+decorations) put their shadow inside their own surface; 0003 doesn't reach them.
 
 ## LeopardWM
 
@@ -209,8 +242,11 @@ run it again.
   | patched | first in-VM restart after a fresh boot | 0 (copy mode) |
 
   `wsl --shutdown` (or a Windows restart) brings shared memory back.
-* **Apps that size in character cells** (Emacs, xterm) end up slightly smaller
-  than their tile. For Emacs: `(setq frame-resize-pixelwise t)`.
+* **Wayland apps with client-side decorations** (GTK) still sit inside their own
+  shadow margin when tiled; patch 0003 covers X11 apps, whose frames Weston draws.
+* **Apps that size in character cells** (Emacs, xterm) can stop short of the
+  right and bottom edges of their tile by up to one cell. For Emacs:
+  `(setq frame-resize-pixelwise t)`.
 * After a Weston crash, WSLGd's relaunches crash-loop on a stale Xwayland
   socket (upstream; see `debug/NOTES.md`) and it gives up after 10 tries:
   `wsl --shutdown` recovers.

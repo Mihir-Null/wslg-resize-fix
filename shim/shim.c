@@ -1,9 +1,10 @@
 /*
  * wslg-resize-fix: version-checking shim for a WSLg Weston module.
  *
- * WSLGd starts weston with --backend=rdp-backend.so --shell=rdprail-shell.so.
- * With WESTON_MODULE_MAP (set through .wslgconfig [system-distro-env]) those
- * names resolve to this shim instead of the stock modules. The shim reads the
+ * WSLGd starts weston with --backend=rdp-backend.so --shell=rdprail-shell.so,
+ * and libweston loads xwayland.so by name. With WESTON_MODULE_MAP (set through
+ * .wslgconfig [system-distro-env]) those names resolve to this shim instead of
+ * the stock modules. The shim reads the
  * weston commit this WSLg was built from (/mnt/wslg/versions.txt) and loads
  *
  *   1. <shim dir>/weston-<commit>/<module>   patched build for exactly this WSLg
@@ -13,9 +14,10 @@
  * loads a module built against a different weston: it falls back to stock
  * behaviour (and the Windows helper reports that a rebuild is needed).
  *
- * Built twice by linux/build-shell.sh:
- *   -DSHIM_BACKEND -DSHIM_MODULE='"rdp-backend.so"'
- *   -DSHIM_SHELL   -DSHIM_MODULE='"rdprail-shell.so"'
+ * Built three times by linux/build-shell.sh:
+ *   -DSHIM_BACKEND  -DSHIM_MODULE='"rdp-backend.so"'
+ *   -DSHIM_SHELL    -DSHIM_MODULE='"rdprail-shell.so"'
+ *   -DSHIM_XWAYLAND -DSHIM_MODULE='"xwayland.so"'
  * It has no libweston build dependency: the entry points only pass opaque
  * pointers through, and weston_log() is looked up at runtime.
  *
@@ -50,8 +52,15 @@ static const char *const stock_globs[] = {
 	"/usr/lib64/weston/rdprail-shell.so",
 	NULL,
 };
+#elif defined(SHIM_XWAYLAND)
+#define ENTRY "weston_module_init"
+static const char *const stock_globs[] = {
+	"/usr/lib/libweston-*/xwayland.so",
+	"/usr/lib64/libweston-*/xwayland.so",
+	NULL,
+};
 #else
-#error "define SHIM_BACKEND or SHIM_SHELL"
+#error "define SHIM_BACKEND, SHIM_SHELL or SHIM_XWAYLAND"
 #endif
 
 static void
@@ -191,6 +200,22 @@ weston_backend_init(void *compositor, void *config_base)
 		return -1;
 	}
 	return init(compositor, config_base);
+}
+#elif defined(SHIM_XWAYLAND)
+EXPORT int
+weston_module_init(void *compositor)
+{
+	int (*init)(void *);
+	void *h = load_target();
+
+	if (!h)
+		return -1;
+	*(void **)&init = dlsym(h, ENTRY);
+	if (!init) {
+		shim_log("loaded module has no %s", ENTRY);
+		return -1;
+	}
+	return init(compositor);
 }
 #else
 EXPORT int

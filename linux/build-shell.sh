@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build patched rdprail-shell.so + rdp-backend.so that are ABI-identical to
+# Build patched rdprail-shell.so, rdp-backend.so and xwayland.so that are ABI-identical to
 # the ones shipped in the running WSLg system distro.
 #
 # Runs INSIDE the WSLg system distro as root:
@@ -16,8 +16,8 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"          # repo root (seen via /mnt/wsl
 BR="${BR:-/tmp/wslg-buildroot}"                    # throwaway Azure Linux build root
 OUT="${OUT:-/tmp/wslg-out}"   # /mnt/wslg/distro is read-only from here; wslg-fix.ps1 copies OUT out
 # OUT layout (what gets installed):
-#   OUT/rdp-backend.so, OUT/rdprail-shell.so   version-checking shims (shim/shim.c)
-#   OUT/weston-<commit>/{rdp-backend,rdprail-shell}.so   patched modules for that WSLg
+#   OUT/{rdp-backend,rdprail-shell,xwayland}.so   version-checking shims (shim/shim.c)
+#   OUT/weston-<commit>/{rdp-backend,rdprail-shell,xwayland}.so   patched modules for that WSLg
 JOBS="${JOBS:-$(nproc)}"
 
 # 1. Which weston commit is this WSLg built from? (recorded by WSLg itself)
@@ -100,7 +100,7 @@ chroot "$BR" /bin/bash -euo pipefail -c "
     -Dremoting=false -Dpipewire=false -Dshell-fullscreen=false -Dcolor-management-lcms=false \
     -Dshell-ivi=false -Dshell-kiosk=false -Ddemo-clients=false -Dsimple-clients=[] -Dtools=[] \
     -Dresize-pool=false -Dwcap-decode=false -Dtest-junit-xml=false
-  ninja -C build -j$JOBS rdprail-shell/rdprail-shell.so libweston/backend-rdp/rdp-backend.so
+  ninja -C build -j$JOBS rdprail-shell/rdprail-shell.so libweston/backend-rdp/rdp-backend.so xwayland/xwayland.so
 "
 
 # 6. Publish results, tagged with the commit they are valid for, and check
@@ -108,7 +108,7 @@ chroot "$BR" /bin/bash -euo pipefail -c "
 #    resolve via $ORIGIN once installed next to the originals).
 MODDIR="$OUT/weston-$WESTON_COMMIT"
 # Only our own outputs are cleared (OUT may be a caller-provided directory).
-rm -rf "$OUT"/weston-* "$OUT"/rdp-backend.so "$OUT"/rdprail-shell.so "$OUT"/weston-commit "$OUT"/wslg-version
+rm -rf "$OUT"/weston-* "$OUT"/rdp-backend.so "$OUT"/rdprail-shell.so "$OUT"/xwayland.so "$OUT"/weston-commit "$OUT"/wslg-version
 mkdir -p "$MODDIR" "$BR/live"
 publish() {  # <build-relative path> <live path>
   local rel="$1" live="$2" name lib d; name="$(basename "$rel")"
@@ -153,6 +153,7 @@ EOF
   fi
 }
 publish rdprail-shell/rdprail-shell.so /usr/lib/weston/rdprail-shell.so
+publish xwayland/xwayland.so /usr/lib/libweston-9/xwayland.so
 publish libweston/backend-rdp/rdp-backend.so /usr/lib/libweston-9/rdp-backend.so
 echo "$WESTON_COMMIT" > "$MODDIR/weston-commit"
 echo "$WSLG_VERSION"  > "$MODDIR/wslg-version"
@@ -164,7 +165,7 @@ mkdir -p "$BR/work/shim"; cp "$HERE/shim/shim.c" "$BR/work/shim/"
 chroot "$BR" bash -euo pipefail <<'EOF'
 cd /work/shim
 nm -D --defined-only /live/needed/libc.so.6 | awk 'NF==3 {print $3}' | sed 's/@@/@/' | sort -u > libc.provided
-for m in BACKEND:rdp-backend.so:weston_backend_init SHELL:rdprail-shell.so:wet_shell_init; do
+for m in BACKEND:rdp-backend.so:weston_backend_init SHELL:rdprail-shell.so:wet_shell_init XWAYLAND:xwayland.so:weston_module_init; do
   IFS=: read -r def out entry <<<"$m"
   gcc -shared -fPIC -O2 -Wall -Wextra -Werror -fvisibility=hidden -D_FORTIFY_SOURCE=2 \
       -DSHIM_$def -DSHIM_MODULE="\"$out\"" -o "$out" shim.c
@@ -177,6 +178,6 @@ for m in BACKEND:rdp-backend.so:weston_backend_init SHELL:rdprail-shell.so:wet_s
   echo "== shim $out: exports $entry, imports only live libc"
 done
 EOF
-cp "$BR/work/shim/rdp-backend.so" "$BR/work/shim/rdprail-shell.so" "$OUT/"
+cp "$BR/work/shim/rdp-backend.so" "$BR/work/shim/rdprail-shell.so" "$BR/work/shim/xwayland.so" "$OUT/"
 (cd "$OUT" && sha256sum *.so weston-*/*.so)
 echo "== done: $OUT"

@@ -3,6 +3,7 @@
 # distro, then restart Weston so it loads them:
 #   rdprail-shell.so  honour the size in Client Window Move requests
 #   rdp-backend.so    window control FIFO ($XDG_RUNTIME_DIR/wslg-window-ctl)
+#   xwayland.so       WESTON_XWM_SHADOW_MARGIN (frame shadow margin of X11 windows)
 #
 # Runs INSIDE the WSLg system distro as root:
 #   wsl.exe -d <distro> --system -u root --exec bash <repo>/linux/apply-shell.sh [apply|revert|status] [module-dir]
@@ -17,7 +18,7 @@
 set -euo pipefail
 
 # <file name>:<live path>
-MODS="rdprail-shell.so:/usr/lib/weston/rdprail-shell.so rdp-backend.so:/usr/lib/libweston-9/rdp-backend.so"
+MODS="rdprail-shell.so:/usr/lib/weston/rdprail-shell.so rdp-backend.so:/usr/lib/libweston-9/rdp-backend.so xwayland.so:/usr/lib/libweston-9/xwayland.so"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ACTION="${1:-status}"
 SRCDIR="${2:-}"
@@ -74,7 +75,7 @@ case "$ACTION" in
   apply)
     if [ -z "$SRCDIR" ]; then
       for c in "/tmp/wslg-out/weston-$(running_commit)" "$HERE/out"; do
-        [ -f "$c/rdprail-shell.so" ] && [ -f "$c/rdp-backend.so" ] && { SRCDIR="$c"; break; }
+        [ -f "$c/rdprail-shell.so" ] && [ -f "$c/rdp-backend.so" ] && [ -f "$c/xwayland.so" ] && { SRCDIR="$c"; break; }
       done
     fi
     [ -n "$SRCDIR" ] || { echo "no patched modules found (build them first)" >&2; exit 1; }

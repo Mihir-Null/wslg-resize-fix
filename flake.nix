@@ -78,7 +78,7 @@
             WESTON_SRC="/mnt/wslg/distro$weston_src" OUT=/tmp/wslg-out \
             bash "/mnt/wslg/distro${source}/linux/build-shell.sh"
           "$wsl" -d "$WSL_DISTRO_NAME" --cd / --system -u root --exec sh -c \
-            'mkdir -p "$1" && rm -rf "$1"/weston-* "$1"/rdp-backend.so "$1"/rdprail-shell.so && cp -r /tmp/wslg-out/. "$1"/' sh "$out"
+            'mkdir -p "$1" && rm -rf "$1"/weston-* "$1"/rdp-backend.so "$1"/rdprail-shell.so "$1"/xwayland.so && cp -r /tmp/wslg-out/. "$1"/' sh "$out"
           echo "== built into $out"
           echo "   install (from Windows PowerShell): .\\wslg-fix.ps1 install"
         '';
