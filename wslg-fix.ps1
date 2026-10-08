@@ -157,7 +157,8 @@ function Build-Modules {
   Write-Host (SysOut 'grep -E "^(==|!!|   [a-z])" /tmp/wslg-build.log')
   New-Item -ItemType Directory -Force $Dist | Out-Null
   $distWsl = To-Wsl $Dist
-  Sys "rm -rf '$distWsl' && mkdir -p '$distWsl' && cp -r /tmp/wslg-out/. '$distWsl'/"
+  # Replace only module outputs: dist\bin holds the helper from build-helper.
+  Sys "mkdir -p '$distWsl' && rm -rf '$distWsl'/weston-* '$distWsl'/rdp-backend.so '$distWsl'/rdprail-shell.so && cp -r /tmp/wslg-out/. '$distWsl'/"
   Write-Host "== modules -> $Dist"
 }
 

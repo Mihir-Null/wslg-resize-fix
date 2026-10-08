@@ -69,39 +69,7 @@
  	if (sx == 0 && sy == 0 &&
  	    shsurf->last_width == surface->width &&
  	    shsurf->last_height == surface->height &&
-@@ -3065,6 +3106,31 @@
- 	}
- }
- 
-+/* A client move/resize that leaves the snapped rect means the window is no
-+ * longer snapped (same state change as an interactive unsnap). Otherwise the
-+ * commit handler would keep putting it back at the snapped position. */
-+static void
-+shell_surface_client_move_unsnap(struct shell_surface *shsurf, int x, int y,
-+				 int width, int height)
-+{
-+	struct weston_surface *surface =
-+		weston_desktop_surface_get_surface(shsurf->desktop_surface);
-+	struct weston_surface_rail_state *rail_state =
-+		(struct weston_surface_rail_state *)surface->backend_state;
-+
-+	if (!shsurf->snapped.is_snapped ||
-+	    (x == shsurf->snapped.x && y == shsurf->snapped.y &&
-+	     width == shsurf->snapped.width && height == shsurf->snapped.height))
-+		return;
-+
-+	shsurf->snapped.is_snapped = false;
-+	shsurf->saved_showstate_valid = false;
-+	if (rail_state) {
-+		rail_state->isWindowSnapped = false;
-+		rail_state->showState_requested = RDP_WINDOW_SHOW;
-+	}
-+}
-+
- static void
- shell_backend_request_window_move(struct weston_surface *surface, int x, int y, int width, int height)
- {
-@@ -3081,12 +3147,65 @@
+@@ -3081,12 +3122,60 @@
  
  	assert(!shsurf->snapped.is_maximized_requested);
  
@@ -135,8 +103,6 @@
 +		else if (max_size.height > 0 && height > max_size.height)
 +			height = max_size.height;
 +
-+		shell_surface_client_move_unsnap(shsurf, x, y, width, height);
-+
 +		if (width != geometry.width || height != geometry.height) {
 +			if (!shsurf->client_move.timeout) {
 +				struct wl_event_loop *loop =
@@ -158,9 +124,6 @@
 +		}
  	}
  
-+	shell_surface_client_move_unsnap(shsurf, x, y,
-+					 shsurf->snapped.width, shsurf->snapped.height);
-+
 +	/* A plain move supersedes any move still waiting for a resize. */
 +	shsurf->client_move.pending = false;
 +	if (shsurf->client_move.timeout)

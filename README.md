@@ -45,7 +45,7 @@ lives in Weston (`rdp-backend` + `rdprail-shell`) inside the WSLg system distro.
 
 | piece | where | what |
 |---|---|---|
-| [`patches/0001`](patches/0001-rdprail-shell-honor-client-window-move-size.patch) | `rdprail-shell.so` | implement the TODO: same size conversion and min/max clamp as the snap path; skip maximized/fullscreen; apply the new position together with the resized buffer (250 ms fallback) so msrdc never sees "new position, old size"; leaving the snapped rect unsnaps |
+| [`patches/0001`](patches/0001-rdprail-shell-honor-client-window-move-size.patch) | `rdprail-shell.so` | implement the TODO: same size conversion and min/max clamp as the snap path; skip maximized/fullscreen; apply the new position together with the resized buffer (250 ms fallback) so msrdc never sees "new position, old size" (proposed upstream as-is) |
 | [`patches/0002`](patches/0002-rdp-backend-window-control-fifo.patch) | `rdp-backend.so` | control FIFO `$XDG_RUNTIME_DIR/wslg-window-ctl`; each `move <id-hex> <l> <t> <r> <b>` line goes to the **unmodified** Client Window Move handler |
 | [`shim/shim.c`](shim/shim.c) | both | loaded in place of the stock modules; picks `weston-<commit>/<module>` for the running WSLg, **else the stock module** |
 | [`helper/`](helper/src/app.rs) | Windows | watches msrdc's windows; when something other than msrdc/Weston moved one, writes its rect to that distro's FIFO |
@@ -180,7 +180,7 @@ build with that entry removed ([`patches/leopardwm/`](patches/leopardwm/)).
 itself, and a relaunched Weston that finds it can't start Xwayland and
 segfaults in upstream teardown (`weston_xserver_shutdown →
 wl_event_source_remove(NULL)`, see [`debug/NOTES.md`](debug/NOTES.md)), so the
-binds are removed first. `tools/gen-0001-part*.py` regenerate patch 0001 from
+binds are removed first. `tools/gen-0001.py` regenerates patch 0001 from
 pristine `shell.c`. Manual poke without the helper (from any distro):
 
 ```sh
