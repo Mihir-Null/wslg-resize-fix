@@ -39,13 +39,20 @@ restart_weston() {
   local old; old="$(pgrep -x weston || true)"
   [ -n "$old" ] || { echo "weston not running; WSLGd will load the module on next start"; return; }
   echo "== restarting weston (pid $old); WSLGd will relaunch it"
-  # Weston leaves Xwayland's /tmp/.X11-unix/X0 behind when it is killed; the
-  # relaunched instance then fails to bind it, exits, and segfaults in upstream
-  # Xwayland teardown (wl_event_source_remove(NULL)) -> WSLGd crash-loops and
-  # gives up (needs `wsl --shutdown`). Unlink socket + lock *before* signalling:
-  # the dying instance doesn't care, and WSLGd relaunches faster than we could
-  # clean up afterwards. Weston's own wayland-0 socket is lock-protected and
-  # rebinds fine.
+  # Xwayland's socket must be gone before the new Weston starts, or it can't
+  # bind :0, bails out, and segfaults in upstream Xwayland teardown
+  # (wl_event_source_remove(NULL)) -> WSLGd crash-loops and gives up.
+  # WSL bind-mounts X0 onto itself (here, and via shared propagation in the
+  # user distro), so it can't simply be unlinked: unmount the per-file binds
+  # first. The *directory* /tmp/.X11-unix is itself the shared tmpfs, so the
+  # new X0 still shows up in the user distro. Do this *before* signalling:
+  # WSLGd relaunches faster than we could clean up afterwards.
+  local m
+  for m in /tmp/.X11-unix/X0 /mnt/wslg/.X11-unix/X0; do
+    while awk -v m="$m" '$5 == m {f=1} END {exit !f}' /proc/self/mountinfo; do
+      umount "$m" || { echo "!! cannot unmount $m; not restarting" >&2; exit 1; }
+    done
+  done
   rm -f /tmp/.X11-unix/X0 /tmp/.X0-lock
   kill -TERM "$old"
   for _ in $(seq 1 50); do

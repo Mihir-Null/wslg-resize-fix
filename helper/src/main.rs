@@ -16,7 +16,7 @@
 //!      us who moved the window (idEventThread is always msrdc's UI thread), so
 //!      we reason from state instead:
 //!        - settled back on the rect we last reported  -> our own echo, skip
-//!        - change began shortly after our nudge        -> Weston's answer, adopt
+//!        - began shortly after our nudge, same origin  -> Weston's answer, adopt
 //!        - mouse button held during the change         -> WSLg server-side
 //!                                                         drag, Weston knows
 //!        - anything else                               -> external WM, sync
@@ -27,7 +27,8 @@
 //!      messages are served before hardware input, so user keystrokes cannot
 //!      interleave. The net displacement is zero, but the loop saw a change, so
 //!      msrdc reports the window's real rect to Weston.
-//!   5. Restore the cursor if the keyboard move loop warped it, rate-limit per
+//!   5. Give focus back (the move loop activates the window), restore the
+//!      cursor if the loop warped it, and rate-limit per
 //!      window so a WM and an app that rounds its size (Emacs char cells)
 //!      cannot ping-pong forever.
 
@@ -243,9 +244,23 @@ fn nudge(hwnd: HWND, timeout: Duration) -> Result<Duration, String> {
             vlog!("  restored cursor ({},{}) -> ({},{})", after.x, after.y, cursor.x, cursor.y);
         }
     }
+    // DefWindowProc activates a window when its move loop starts, so the nudge
+    // steals focus. Hand it straight back: attach to the (now foreground) msrdc
+    // thread's input queue, which lets us call SetForegroundWindow, then detach.
     let fg_after = unsafe { GetForegroundWindow() };
-    if fg_after != fg_before {
-        log!("  WARNING: foreground changed {:?} -> {:?} during nudge", fg_before.0, fg_after.0);
+    if fg_after != fg_before && !fg_before.is_invalid() && unsafe { IsWindow(fg_before) }.as_bool() {
+        let me = unsafe { GetCurrentThreadId() };
+        let fg_tid = unsafe { GetWindowThreadProcessId(fg_after, None) };
+        let attached = fg_tid != 0 && fg_tid != me && unsafe { AttachThreadInput(me, fg_tid, true) }.as_bool();
+        let ok = unsafe { SetForegroundWindow(fg_before) }.as_bool();
+        if attached {
+            let _ = unsafe { AttachThreadInput(me, fg_tid, false) };
+        }
+        if ok {
+            vlog!("  restored foreground {:?} (nudge had activated {:?})", fg_before.0, fg_after.0);
+        } else {
+            log!("  WARNING: could not restore foreground {:?} (now {:?})", fg_before.0, fg_after.0);
+        }
     }
     if !entered {
         return Err(format!("modal loop never observed (waited {dt:?})"));
@@ -310,7 +325,12 @@ unsafe extern "system" fn on_tick(_: HWND, _: u32, _: usize, _: u32) {
                 vlog!("{:#x} settled on reported rect {} (echo)", h, fmt_rect(&r));
                 continue;
             }
-            if w.last_sync.is_some_and(|t| first >= t && first.duration_since(t) < cfg.response_window) {
+            // Weston answers a sync by resizing (app may round the size) but it
+            // never moves the window, so a reply keeps the reported top-left.
+            // A *position* change in that window is the WM still animating /
+            // re-placing (LeopardWM does both) and must be synced.
+            let same_origin = w.reported.is_some_and(|p| p.left == r.left && p.top == r.top);
+            if same_origin && w.last_sync.is_some_and(|t| first >= t && first.duration_since(t) < cfg.response_window) {
                 vlog!("{:#x} -> {} is Weston's reply to our sync; adopting", h, fmt_rect(&r));
                 w.reported = Some(r);
                 continue;
