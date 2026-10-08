@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build a patched rdprail-shell.so that is ABI-identical to the one shipped in
-# the running WSLg system distro.
+# Build patched rdprail-shell.so + rdp-backend.so that are ABI-identical to
+# the ones shipped in the running WSLg system distro.
 #
 # Runs INSIDE the WSLg system distro as root:
 #   wsl.exe -d <distro> --system -u root --exec bash /mnt/wslg/distro/<path>/linux/build-shell.sh
@@ -65,7 +65,7 @@ if [ ! -f "$SRC/.commit" ] || [ "$(cat "$SRC/.commit")" != "$WESTON_COMMIT" ]; t
   rm -rf "$SRC"; mkdir -p "$SRC"
   tar -xzf "$TARBALL" -C "$SRC" --strip-components=1
   # upstream rdprail-shell sources use CRLF; normalise so the patch applies
-  sed -i 's/\r$//' "$SRC/rdprail-shell/shell.c"
+  sed -i 's/\r$//' "$SRC/rdprail-shell/shell.c" "$SRC/libweston/backend-rdp/rdprail.c"
   for p in "$HERE"/patches/*.patch; do
     echo "   applying $(basename "$p")"
     chroot "$BR" patch -d /work/weston -p1 --forward < "$p"
@@ -88,22 +88,48 @@ chroot "$BR" /bin/bash -euo pipefail -c "
     -Dremoting=false -Dpipewire=false -Dshell-fullscreen=false -Dcolor-management-lcms=false \
     -Dshell-ivi=false -Dshell-kiosk=false -Ddemo-clients=false -Dsimple-clients=[] -Dtools=[] \
     -Dresize-pool=false -Dwcap-decode=false -Dtest-junit-xml=false
-  ninja -C build -j$JOBS rdprail-shell/rdprail-shell.so
+  ninja -C build -j$JOBS rdprail-shell/rdprail-shell.so libweston/backend-rdp/rdp-backend.so
 "
 
-# 6. Publish result, tagged with the commit it is valid for.
-mkdir -p "$OUT"
-chroot "$BR" strip --strip-debug /work/weston/build/rdprail-shell/rdprail-shell.so -o /work/rdprail-shell.stripped.so \
-  && cp "$BR/work/rdprail-shell.stripped.so" "$OUT/rdprail-shell.so"
+# 6. Publish results, tagged with the commit they are valid for, and check
+#    each imports exactly what the stock module does (libexec_weston etc.
+#    resolve via $ORIGIN once installed next to the originals).
+mkdir -p "$OUT" "$BR/live"
+publish() {  # <build-relative path> <live path>
+  local rel="$1" live="$2" name; name="$(basename "$rel")"
+  chroot "$BR" strip --strip-debug "/work/weston/build/$rel" -o "/work/$name"
+  cp "$BR/work/$name" "$OUT/$name"
+  local stock="/tmp/$name.orig"; [ -f "$stock" ] || stock="$live"   # apply-shell.sh's backup, if patched
+  cp "$OUT/$name" "$BR/live/new.so"; cp "$stock" "$BR/live/orig.so"
+  # Exports must be identical. Imports may only grow by versioned glibc
+  # symbols (the control FIFO needs mkfifo/sscanf/...); anything else new
+  # would mean we're linking against something the live distro might not have.
+  # (Runs in the build root: the system distro itself has no nm/diff.)
+  if chroot "$BR" bash -euo pipefail -s "$name" <<'EOF'
+cd /live
+for f in new orig; do
+  nm -D --undefined-only $f.so | awk '{print $2}' | sort -u > $f.und
+  nm -D --defined-only   $f.so | awk '{print $3}' | sort -u > $f.def
+done
+if [ "$(comm -3 orig.def new.def)" ]; then
+  echo "!! $1: exported symbols differ from stock:"; comm -3 orig.def new.def; exit 1
+fi
+gone="$(comm -23 orig.und new.und | tr '\n' ' ')"; [ -z "$gone" ] || echo "   $1: no longer imports: $gone"
+extra="$(comm -13 orig.und new.und)"
+if [ "$(grep -v '@GLIBC_' <<<"$extra" || true)" ]; then
+  echo "!! $1: new non-glibc imports:"; grep -v '@GLIBC_' <<<"$extra"; exit 1
+fi
+[ -z "$extra" ] || echo "   $1: new glibc imports: $(tr '\n' ' ' <<<"$extra")"
+EOF
+  then
+    echo "== $name: exports identical to stock, imports OK ($(stat -c %s "$stock") -> $(stat -c %s "$OUT/$name") bytes)"
+  else
+    echo "!! $name: symbol check failed — do NOT apply" >&2; exit 1
+  fi
+}
+publish rdprail-shell/rdprail-shell.so /usr/lib/weston/rdprail-shell.so
+publish libweston/backend-rdp/rdp-backend.so /usr/lib/libweston-9/rdp-backend.so
 echo "$WESTON_COMMIT" > "$OUT/weston-commit"
 echo "$WSLG_VERSION"  > "$OUT/wslg-version"
-sha256sum "$OUT/rdprail-shell.so"
-# Sanity: the patched module must import exactly what the stock one imports
-# (libexec_weston resolves via $ORIGIN once installed next to the original).
-mkdir -p "$BR/live"
-STOCK=/tmp/rdprail-shell.so.orig; [ -f "$STOCK" ] || STOCK=/usr/lib/weston/rdprail-shell.so   # apply-shell.sh's backup, if patched
-cp "$OUT/rdprail-shell.so" "$BR/live/new.so"; cp "$STOCK" "$BR/live/orig.so"
-chroot "$BR" bash -c 'cd /live && for f in new orig; do nm -D --undefined-only $f.so | awk "{print \$2}" | sort -u > $f.und; done && diff -q orig.und new.und' \
-  && echo "== imports identical to the stock module" \
-  || { echo "!! imported symbols differ from the stock module — do NOT apply" >&2; exit 1; }
-echo "== done: $OUT/rdprail-shell.so"
+(cd "$OUT" && sha256sum *.so)
+echo "== done: $OUT"

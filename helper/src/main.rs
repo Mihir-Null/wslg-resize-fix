@@ -7,38 +7,57 @@
 //!     Win32 move/size modal loop *ends with a change*. A bare SetWindowPos
 //!     from another process produces nothing, so Weston never learns about it.
 //!   * Weston's rdprail-shell ignores the size in that PDU unless patched
-//!     (see ../patches); position is honoured either way.
+//!     (patches/0001).
 //!
-//! What this program does:
+//! The patched rdp-backend (patches/0002) therefore listens on a FIFO,
+//! `/mnt/wslg/runtime-dir/wslg-window-ctl`, for lines of the form
+//!
+//!     move <rail-window-id-hex> <left> <top> <right> <bottom>
+//!
+//! and feeds each one to its *unmodified* Client Window Move handler, exactly
+//! as if msrdc had sent the PDU. This program is the Windows half:
+//!
 //!   1. SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE) on all processes, keep
 //!      only top-level, visible RAIL_WINDOWs owned by msrdc.exe.
-//!   2. Decide whether Weston already knows the new rect. WinEvents can't tell
+//!   2. Map HWND -> RAIL window id via the `WslgServerWindowId` property msrdc
+//!      sets on every RAIL_WINDOW (low 32 bits = the id Weston uses).
+//!   3. Decide whether Weston already knows the new rect. WinEvents can't tell
 //!      us who moved the window (idEventThread is always msrdc's UI thread), so
 //!      we reason from state instead:
-//!        - settled back on the rect we last reported  -> our own echo, skip
-//!        - began shortly after our nudge, same origin  -> Weston's answer, adopt
-//!        - mouse button held during the change         -> WSLg server-side
+//!        - settled back on the rect we last reported  -> echo, skip
+//!        - began shortly after our sync, same origin   -> Weston's answer
+//!                                                         (app rounded its
+//!                                                         size), adopt
+//!        - mouse button held during the change         -> msrdc's own drag
+//!                                                         or WSLg server-side
 //!                                                         drag, Weston knows
 //!        - anything else                               -> external WM, sync
-//!   3. Debounce until the rect has been still for `--settle-ms` (LeopardWM
-//!      animates layout changes frame by frame).
-//!   4. "Nudge": post WM_SYSCOMMAND(SC_MOVE) + VK_RIGHT, VK_LEFT, VK_RETURN.
-//!      All four messages are queued before the loop starts, and posted
-//!      messages are served before hardware input, so user keystrokes cannot
-//!      interleave. The net displacement is zero, but the loop saw a change, so
-//!      msrdc reports the window's real rect to Weston.
-//!   5. Give focus back (the move loop activates the window), restore the
-//!      cursor if the loop warped it, and rate-limit per
-//!      window so a WM and an app that rounds its size (Emacs char cells)
-//!      cannot ping-pong forever.
+//!   4. Debounce until the rect has been still for `--settle-ms` (LeopardWM
+//!      animates layout changes frame by frame), then send one `move` line.
+//!   5. Rate-limit per window so a WM and an app that rounds its size (Emacs
+//!      character cells) cannot ping-pong forever.
+//!
+//! Transport: the FIFO lives in the WSLg system distro's shared runtime dir,
+//! which every user distro also sees at /mnt/wslg/runtime-dir. A small relay,
+//! `wsl.exe [-d distro] --exec /bin/sh -c '<copy stdin to FIFO>'`, runs for
+//! the lifetime of this program; it is (re)spawned on demand by a writer
+//! thread so the UI/hook thread never blocks on it.
+//!
+//! Compared with the previous approach (posting SC_MOVE + arrow keys to make
+//! msrdc run its own move loop) nothing is injected into msrdc: no focus
+//! changes, no cursor warps, no WM_ENTERSIZEMOVE that other WMs react to.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
+use std::os::windows::process::CommandExt;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use windows::core::{w, PWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONULL};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -47,10 +66,10 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_LBUTTON, VK_LEFT, VK_MBUTTON, VK_RBUTTON, VK_RETURN, VK_RIGHT,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+const CTL_FIFO: &str = "/mnt/wslg/runtime-dir/wslg-window-ctl";
 
 // ---------------------------------------------------------------- config ---
 
@@ -58,10 +77,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 struct Config {
     dry_run: bool,
     verbose: bool,
-    settle: Duration,       // rect must be unchanged this long before we nudge
-    max_nudges: usize,      // per window, within `window`
+    distro: Option<String>, // None = default WSL distro
+    settle: Duration,       // rect must be unchanged this long before we sync
+    max_syncs: usize,       // per window, within `rate_window`
     rate_window: Duration,
-    loop_timeout: Duration, // give up waiting for msrdc's modal loop to finish
     response_window: Duration, // changes starting this soon after a sync = Weston's reply
 }
 
@@ -70,10 +89,10 @@ impl Default for Config {
         Self {
             dry_run: false,
             verbose: false,
+            distro: None,
             settle: Duration::from_millis(120),
-            max_nudges: 3,
+            max_syncs: 3,
             rate_window: Duration::from_millis(2000),
-            loop_timeout: Duration::from_millis(500),
             response_window: Duration::from_millis(600),
         }
     }
@@ -87,9 +106,9 @@ struct Win {
     pending_last: Option<Instant>,  // latest event of the current burst
     buttons_held: bool,             // a mouse button was down during the burst
     last_rect: RECT,
-    reported: Option<RECT>,         // rect Weston is believed to have
+    reported: Option<RECT>, // rect Weston is believed to have
     last_sync: Option<Instant>,
-    nudges: VecDeque<Instant>,
+    syncs: VecDeque<Instant>,
 }
 
 #[derive(Default)]
@@ -97,6 +116,7 @@ struct State {
     cfg: Config,
     is_msrdc: HashMap<u32, bool>, // pid -> owned by msrdc.exe?
     wins: HashMap<isize, Win>,
+    relay: Option<Sender<String>>,
 }
 
 // Logging state lives outside STATE so log!() is safe while STATE is borrowed.
@@ -180,6 +200,19 @@ fn is_candidate(st: &mut State, hwnd: HWND) -> bool {
     *st.is_msrdc.entry(pid).or_insert_with(|| exe_is_msrdc(pid))
 }
 
+/// The RAIL window id Weston knows this HWND by. msrdc stores it in two window
+/// properties: `WslgServerWindowId` (0x1_0000_0000 | id) and
+/// `RailWindowIdForDebugOnly` (id). Property values are HANDLE-sized integers.
+fn rail_window_id(hwnd: HWND) -> Option<u32> {
+    let get = |name: PCWSTR| unsafe { GetPropW(hwnd, name) }.0 as usize as u64;
+    let v = get(w!("WslgServerWindowId"));
+    if v != 0 {
+        return Some(v as u32); // low 32 bits
+    }
+    let v = get(w!("RailWindowIdForDebugOnly"));
+    (v != 0).then_some(v as u32)
+}
+
 fn on_any_monitor(r: &RECT) -> bool {
     !unsafe { MonitorFromRect(r, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
@@ -192,80 +225,106 @@ fn mouse_buttons_down() -> bool {
     }
 }
 
-fn in_move_size(tid: u32) -> bool {
-    let mut gti = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
-    unsafe { GetGUIThreadInfo(tid, &mut gti) }.is_ok() && (gti.flags.0 & GUI_INMOVESIZE.0) != 0
+fn move_line(id: u32, r: &RECT) -> String {
+    format!("move {:x} {} {} {} {}\n", id, r.left, r.top, r.right, r.bottom)
 }
 
-// ----------------------------------------------------------------- nudge ---
+// ----------------------------------------------------------------- relay ---
 
-/// Make msrdc report `hwnd`'s current rect to Weston. Returns loop duration.
-fn nudge(hwnd: HWND, timeout: Duration) -> Result<Duration, String> {
-    let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
-    if in_move_size(tid) {
-        return Err("msrdc thread already in a move/size loop".into());
-    }
-    let mut cursor = POINT::default();
-    let have_cursor = unsafe { GetCursorPos(&mut cursor) }.is_ok();
-    vlog!("  cursor before: {:?} ({},{})", have_cursor, cursor.x, cursor.y);
-    let fg_before = unsafe { GetForegroundWindow() };
+/// Shell run inside WSL. Pure POSIX-sh builtins, so it works in any distro
+/// (NixOS has nothing but sh in /bin). The `-p` test refuses to create a
+/// regular file if the patched backend isn't loaded. Opening a FIFO for
+/// writing blocks until a reader exists; Weston keeps it open O_RDWR.
+/// When Weston restarts the write fails (EPIPE), the relay exits and the
+/// writer thread respawns it for the next line.
+const RELAY_SH: &str = r#"f=/mnt/wslg/runtime-dir/wslg-window-ctl
+[ -p "$f" ] || { echo "relay: $f missing (patched rdp-backend not loaded?)" >&2; exit 3; }
+exec 3>"$f" || exit 4
+echo "relay: connected to $f" >&2
+while IFS= read -r l; do printf '%s\n' "$l" >&3 || exit 5; done"#;
 
-    // lParam for WM_KEYDOWN: repeat=1, scan code in bits 16..23 (+extended).
-    let kd = |vk: u16, scan: u32, ext: bool| -> (WPARAM, LPARAM) {
-        (WPARAM(vk as usize), LPARAM((1 | (scan << 16) | if ext { 1 << 24 } else { 0 }) as isize))
-    };
-    let msgs = [
-        (WM_SYSCOMMAND, WPARAM(SC_MOVE as usize), LPARAM(0)),
-        { let (w, l) = kd(VK_RIGHT.0, 0x4D, true); (WM_KEYDOWN, w, l) },
-        { let (w, l) = kd(VK_LEFT.0, 0x4B, true); (WM_KEYDOWN, w, l) },
-        { let (w, l) = kd(VK_RETURN.0, 0x1C, false); (WM_KEYDOWN, w, l) },
-    ];
-    let t0 = Instant::now();
-    for (m, w, l) in msgs {
-        unsafe { PostMessageW(hwnd, m, w, l) }.map_err(|e| format!("PostMessageW: {e}"))?;
-    }
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const RESPAWN_BACKOFF: Duration = Duration::from_secs(3);
 
-    // Wait for msrdc's thread to enter and then leave the modal loop.
-    let mut entered = false;
-    while t0.elapsed() < timeout {
-        let now_in = in_move_size(tid);
-        entered |= now_in;
-        if entered && !now_in {
-            break;
+struct Relay {
+    distro: Option<String>,
+    child: Option<(Child, ChildStdin)>,
+    last_spawn: Option<Instant>,
+}
+
+impl Relay {
+    fn spawn(&mut self) -> bool {
+        if self.last_spawn.is_some_and(|t| t.elapsed() < RESPAWN_BACKOFF) {
+            return false;
         }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let dt = t0.elapsed();
-
-    if have_cursor {
-        let mut after = POINT::default();
-        if unsafe { GetCursorPos(&mut after) }.is_ok() && (after.x != cursor.x || after.y != cursor.y) {
-            let _ = unsafe { SetCursorPos(cursor.x, cursor.y) };
-            vlog!("  restored cursor ({},{}) -> ({},{})", after.x, after.y, cursor.x, cursor.y);
+        self.last_spawn = Some(Instant::now());
+        let mut cmd = Command::new("wsl.exe");
+        if let Some(d) = &self.distro {
+            cmd.args(["-d", d]);
         }
-    }
-    // DefWindowProc activates a window when its move loop starts, so the nudge
-    // steals focus. Hand it straight back: attach to the (now foreground) msrdc
-    // thread's input queue, which lets us call SetForegroundWindow, then detach.
-    let fg_after = unsafe { GetForegroundWindow() };
-    if fg_after != fg_before && !fg_before.is_invalid() && unsafe { IsWindow(fg_before) }.as_bool() {
-        let me = unsafe { GetCurrentThreadId() };
-        let fg_tid = unsafe { GetWindowThreadProcessId(fg_after, None) };
-        let attached = fg_tid != 0 && fg_tid != me && unsafe { AttachThreadInput(me, fg_tid, true) }.as_bool();
-        let ok = unsafe { SetForegroundWindow(fg_before) }.as_bool();
-        if attached {
-            let _ = unsafe { AttachThreadInput(me, fg_tid, false) };
-        }
-        if ok {
-            vlog!("  restored foreground {:?} (nudge had activated {:?})", fg_before.0, fg_after.0);
-        } else {
-            log!("  WARNING: could not restore foreground {:?} (now {:?})", fg_before.0, fg_after.0);
+        cmd.args(["--exec", "/bin/sh", "-c", RELAY_SH])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()) // relay messages land in our log
+            .creation_flags(CREATE_NO_WINDOW);
+        match cmd.spawn() {
+            Ok(mut c) => {
+                let stdin = c.stdin.take().expect("piped stdin");
+                log!("relay: spawned wsl.exe pid {}", c.id());
+                self.child = Some((c, stdin));
+                true
+            }
+            Err(e) => {
+                log!("relay: cannot start wsl.exe: {e}");
+                false
+            }
         }
     }
-    if !entered {
-        return Err(format!("modal loop never observed (waited {dt:?})"));
+
+    /// Reap a relay that has exited on its own (e.g. Weston restarted).
+    fn reap(&mut self) {
+        if let Some((c, _)) = &mut self.child {
+            if let Ok(Some(status)) = c.try_wait() {
+                log!("relay: exited ({status})");
+                self.child = None;
+            }
+        }
     }
-    Ok(dt)
+
+    fn send(&mut self, line: &str) -> bool {
+        self.reap();
+        if self.child.is_none() && !self.spawn() {
+            return false;
+        }
+        let (_, stdin) = self.child.as_mut().unwrap();
+        if stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).is_ok() {
+            return true;
+        }
+        log!("relay: write failed; restarting");
+        if let Some((mut c, stdin)) = self.child.take() {
+            drop(stdin);
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        false
+    }
+}
+
+/// Writer thread: owns the relay so the hook thread never blocks on a pipe.
+/// Lines that can't be delivered are dropped (the next WM action resyncs).
+fn start_relay(distro: Option<String>) -> Sender<String> {
+    let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut relay = Relay { distro, child: None, last_spawn: None };
+        relay.spawn(); // connect eagerly so the first sync isn't delayed
+        for line in rx {
+            if !relay.send(&line) {
+                log!("relay: dropped {}", line.trim_end());
+            }
+        }
+        // channel closed: dropping stdin ends the relay's read loop
+    });
+    tx
 }
 
 // ------------------------------------------------------------- callbacks ---
@@ -302,13 +361,12 @@ unsafe extern "system" fn on_win_event(
 }
 
 unsafe extern "system" fn on_tick(_: HWND, _: u32, _: usize, _: u32) {
-    // Collect due windows first; never hold the RefCell borrow across nudge().
-    let (due, cfg) = STATE.with(|s| {
+    STATE.with(|s| {
         let st = &mut *s.borrow_mut();
         let now = Instant::now();
         let cfg = st.cfg.clone();
-        let mut due = Vec::new();
         st.wins.retain(|&h, _| unsafe { IsWindow(HWND(h as *mut _)).as_bool() });
+        let mut out = Vec::new();
         for (&h, w) in st.wins.iter_mut() {
             let (Some(first), Some(last)) = (w.pending_first, w.pending_last) else { continue };
             if now.duration_since(last) < cfg.settle {
@@ -325,10 +383,10 @@ unsafe extern "system" fn on_tick(_: HWND, _: u32, _: usize, _: u32) {
                 vlog!("{:#x} settled on reported rect {} (echo)", h, fmt_rect(&r));
                 continue;
             }
-            // Weston answers a sync by resizing (app may round the size) but it
-            // never moves the window, so a reply keeps the reported top-left.
-            // A *position* change in that window is the WM still animating /
-            // re-placing (LeopardWM does both) and must be synced.
+            // Weston answers a sync by resizing (the app may round the size)
+            // but it never moves the window, so a reply keeps the reported
+            // top-left. A *position* change in that window is the WM still
+            // animating / re-placing (LeopardWM does both) and must be synced.
             let same_origin = w.reported.is_some_and(|p| p.left == r.left && p.top == r.top);
             if same_origin && w.last_sync.is_some_and(|t| first >= t && first.duration_since(t) < cfg.response_window) {
                 vlog!("{:#x} -> {} is Weston's reply to our sync; adopting", h, fmt_rect(&r));
@@ -336,58 +394,44 @@ unsafe extern "system" fn on_tick(_: HWND, _: u32, _: usize, _: u32) {
                 continue;
             }
             if w.buttons_held {
-                vlog!("{:#x} -> {} came from a WSLg (server-side) drag; adopting", h, fmt_rect(&r));
+                vlog!("{:#x} -> {} came from a mouse drag (msrdc/Weston know); adopting", h, fmt_rect(&r));
                 w.reported = Some(r);
                 continue;
             }
-            while w.nudges.front().is_some_and(|t| now.duration_since(*t) > cfg.rate_window) {
-                w.nudges.pop_front();
+            if !on_any_monitor(&r) {
+                // LeopardWM parks scrolled-away columns off-screen; sync when back.
+                vlog!("{:#x} off-screen {}, deferring until visible", h, fmt_rect(&r));
+                continue;
             }
-            if w.nudges.len() >= cfg.max_nudges {
+            while w.syncs.front().is_some_and(|t| now.duration_since(*t) > cfg.rate_window) {
+                w.syncs.pop_front();
+            }
+            if w.syncs.len() >= cfg.max_syncs {
                 log!("{:#x} rate-limited (WM and app disagree on size?); leaving at {}", h, fmt_rect(&r));
                 w.reported = Some(r);
                 continue;
             }
-            due.push((h, r));
-        }
-        (due, cfg)
-    });
-
-    for (h, r) in due {
-        let hwnd = HWND(h as *mut _);
-        if mouse_buttons_down() {
-            // never start a modal loop mid-drag; re-queue for the next tick
-            STATE.with(|s| if let Some(w) = s.borrow_mut().wins.get_mut(&h) {
-                let now = Instant::now();
-                w.pending_first.get_or_insert(now);
-                w.pending_last = Some(now);
-            });
-            continue;
-        }
-        if !on_any_monitor(&r) {
-            // LeopardWM parks scrolled-away columns off-screen; sync when back.
-            vlog!("{:#x} off-screen {}, deferring until visible", h, fmt_rect(&r));
-            continue;
-        }
-        STATE.with(|s| {
-            if let Some(w) = s.borrow_mut().wins.get_mut(&h) {
-                let now = Instant::now();
+            let hwnd = HWND(h as *mut _);
+            let Some(id) = rail_window_id(hwnd) else {
+                log!("{:#x} has no WslgServerWindowId property; cannot sync", h);
                 w.reported = Some(r);
-                w.nudges.push_back(now);
+                continue;
+            };
+            w.reported = Some(r);
+            w.syncs.push_back(now);
+            w.last_sync = Some(now);
+            out.push((h, id, r));
+        }
+        for (h, id, r) in out {
+            let hwnd = HWND(h as *mut _);
+            if cfg.dry_run {
+                log!("[dry-run] would sync {:#x} (rail 0x{:x}) '{}' {}", h, id, title(hwnd), fmt_rect(&r));
+            } else if let Some(tx) = &st.relay {
+                let _ = tx.send(move_line(id, &r));
+                log!("synced {:#x} (rail 0x{:x}) '{}' {}", h, id, title(hwnd), fmt_rect(&r));
             }
-        });
-        if cfg.dry_run {
-            log!("[dry-run] would sync {:#x} '{}' {}", h, title(hwnd), fmt_rect(&r));
-            continue;
         }
-        let res = nudge(hwnd, cfg.loop_timeout);
-        // Stamp *after* the loop so its own echo events fall inside the reply window.
-        STATE.with(|s| if let Some(w) = s.borrow_mut().wins.get_mut(&h) { w.last_sync = Some(Instant::now()); });
-        match res {
-            Ok(dt) => log!("synced {:#x} '{}' {} ({:?})", h, title(hwnd), fmt_rect(&r), dt),
-            Err(e) => log!("sync {:#x} failed: {e}", h),
-        }
-    }
+    });
 }
 
 static mut MAIN_TID: u32 = 0;
@@ -400,15 +444,18 @@ unsafe extern "system" fn on_ctrl(_: u32) -> BOOL {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: wslg-resize-sync [--dry-run] [-v] [--settle-ms N]\n\
+        "usage: wslg-resize-sync [--dry-run] [-v] [--settle-ms N] [-d DISTRO]\n\
          \x20      wslg-resize-sync list\n\
-         \x20      wslg-resize-sync nudge <hwnd-hex>"
+         \x20      wslg-resize-sync [-d DISTRO] send <hwnd-hex>   (sync one window now)\n\
+         \n\
+         Needs the patched WSLg rdp-backend ({CTL_FIFO})."
     );
     std::process::exit(2);
 }
 
 fn main() {
     unsafe {
+        // Physical pixels everywhere, matching what msrdc puts in its own PDUs.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     let mut cfg = Config::default();
@@ -418,11 +465,12 @@ fn main() {
         match a.as_str() {
             "--dry-run" => cfg.dry_run = true,
             "-v" | "--verbose" => cfg.verbose = true,
+            "-d" | "--distro" => cfg.distro = Some(args.next().unwrap_or_else(|| usage())),
             "--settle-ms" => {
                 cfg.settle = Duration::from_millis(args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()))
             }
             "list" => cmd = Some(("list".into(), None)),
-            "nudge" => cmd = Some(("nudge".into(), Some(args.next().unwrap_or_else(|| usage())))),
+            "send" => cmd = Some(("send".into(), Some(args.next().unwrap_or_else(|| usage())))),
             _ => usage(),
         }
     }
@@ -432,17 +480,7 @@ fn main() {
 
     match cmd {
         Some((c, _)) if c == "list" => return list(),
-        Some((c, Some(h))) if c == "nudge" => {
-            let h = isize::from_str_radix(h.trim_start_matches("0x"), 16).unwrap_or_else(|_| usage());
-            let hwnd = HWND(h as *mut _);
-            log!("before: {}", rect_of(hwnd).map(|r| fmt_rect(&r)).unwrap_or_default());
-            match nudge(hwnd, cfg.loop_timeout) {
-                Ok(dt) => log!("ok, loop took {dt:?}"),
-                Err(e) => log!("failed: {e}"),
-            }
-            log!("after:  {}", rect_of(hwnd).map(|r| fmt_rect(&r)).unwrap_or_default());
-            return;
-        }
+        Some((c, Some(h))) if c == "send" => return send_once(&cfg, &h),
         _ => {}
     }
 
@@ -451,6 +489,10 @@ fn main() {
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         eprintln!("wslg-resize-sync is already running");
         std::process::exit(1);
+    }
+    if !cfg.dry_run {
+        let tx = start_relay(cfg.distro.clone());
+        STATE.with(|s| s.borrow_mut().relay = Some(tx));
     }
 
     unsafe {
@@ -472,7 +514,7 @@ fn main() {
         SetTimer(None, 0, 30, Some(on_tick));
         log!(
             "watching RAIL_WINDOWs (settle {:?}, max {} syncs/{:?}{})",
-            cfg.settle, cfg.max_nudges, cfg.rate_window, if cfg.dry_run { ", DRY RUN" } else { "" }
+            cfg.settle, cfg.max_syncs, cfg.rate_window, if cfg.dry_run { ", DRY RUN" } else { "" }
         );
 
         let mut msg = MSG::default();
@@ -481,8 +523,31 @@ fn main() {
             DispatchMessageW(&msg);
         }
         let _ = UnhookWinEvent(hook);
+        STATE.with(|s| s.borrow_mut().relay = None); // closes the relay
         log!("bye");
     }
+}
+
+/// One-shot: send the window's current rect, wait briefly, show the result.
+fn send_once(cfg: &Config, h: &str) {
+    let h = isize::from_str_radix(h.trim_start_matches("0x"), 16).unwrap_or_else(|_| usage());
+    let hwnd = HWND(h as *mut _);
+    let (Some(r), Some(id)) = (rect_of(hwnd), rail_window_id(hwnd)) else {
+        log!("{h:#x}: not a WSLg window (no rect or WslgServerWindowId)");
+        std::process::exit(1);
+    };
+    log!("before: rail 0x{id:x} {}", fmt_rect(&r));
+    let mut relay = Relay { distro: cfg.distro.clone(), child: None, last_spawn: None };
+    if !relay.send(&move_line(id, &r)) {
+        log!("send failed");
+        std::process::exit(1);
+    }
+    if let Some((c, stdin)) = relay.child.take() {
+        drop(stdin); // EOF -> relay exits after forwarding
+        let _ = c.wait_with_output();
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    log!("after:  {}", rect_of(hwnd).map(|r| fmt_rect(&r)).unwrap_or_default());
 }
 
 fn list() {
@@ -491,7 +556,8 @@ fn list() {
             let st = &mut *s.borrow_mut();
             if is_candidate(st, hwnd) {
                 let r = rect_of(hwnd).unwrap_or_default();
-                println!("{:#x}\t{}\t{}", hwnd.0 as isize, fmt_rect(&r), title(hwnd));
+                let id = rail_window_id(hwnd).map(|i| format!("0x{i:x}")).unwrap_or("?".into());
+                println!("{:#x}\trail {}\t{}\t{}", hwnd.0 as isize, id, fmt_rect(&r), title(hwnd));
             }
         });
         TRUE

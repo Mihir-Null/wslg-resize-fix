@@ -1,0 +1,181 @@
+--- a/libweston/backend-rdp/rdprail.c
++++ b/libweston/backend-rdp/rdprail.c
+@@ -42,6 +42,9 @@
+ #include <wchar.h>
+ #include <strings.h>
+ 
++#include <fcntl.h>
++#include <sys/stat.h>
++
+ #include "rdp.h"
+ 
+ #include "libweston-internal.h"
+@@ -470,6 +473,151 @@
+ 	return CHANNEL_RC_OK;
+ }
+ 
++/*
++ * wslg-resize-fix: window control FIFO.
++ *
++ * msrdc only sends a Client Window Move PDU when a Win32 move/size modal loop
++ * ends, so window managers on the Windows side (SetWindowPos) never reach
++ * Weston. A helper on the Windows side reads the RAIL window id msrdc stores
++ * on each RAIL_WINDOW (WslgServerWindowId) and writes
++ *
++ *     move <windowId-hex> <left> <top> <right> <bottom>\n
++ *
++ * (client coordinates, i.e. exactly the fields of RAIL_WINDOW_MOVE_ORDER) to
++ * $XDG_RUNTIME_DIR/wslg-window-ctl. Each line is handed to the unmodified
++ * ClientWindowMove handler, so coordinate translation, resize margins and
++ * shadow handling are identical to a real PDU.
++ *
++ * The FIFO is opened O_RDWR so it never reports EOF when a writer goes away,
++ * and it is reused (not recreated) across Weston restarts so a long-lived
++ * writer keeps working. All state is file-static: no struct layout changes.
++ */
++#define RDP_RAIL_CTL_FIFO_NAME "wslg-window-ctl"
++
++static struct {
++	int fd;
++	struct wl_event_source *source;
++	char path[256];
++	char buf[1024];
++	size_t len;
++} rail_ctl = { .fd = -1 };
++
++static void
++rdp_rail_ctl_handle_line(struct rdp_backend *b, const char *line)
++{
++	struct rdp_rail_dispatch_data *data;
++	RdpPeerContext *peer_ctx;
++	unsigned long window_id;
++	long left, top, right, bottom;
++
++	if (sscanf(line, "move %lx %ld %ld %ld %ld", &window_id,
++		   &left, &top, &right, &bottom) != 5) {
++		rdp_debug_error(b, "wslg ctl: ignoring malformed command '%.64s'\n", line);
++		return;
++	}
++	if (window_id > UINT32_MAX || right <= left || bottom <= top ||
++	    left < INT16_MIN || top < INT16_MIN ||
++	    right > INT16_MAX || bottom > INT16_MAX) {
++		rdp_debug_error(b, "wslg ctl: ignoring out-of-range values for 0x%lx\n", window_id);
++		return;
++	}
++	if (!b->rdp_peer || !b->rdp_peer->context)
++		return;
++	peer_ctx = (RdpPeerContext *)b->rdp_peer->context;
++	if (!peer_ctx->activationRailCompleted)
++		return;
++
++	rdp_debug(b, "wslg ctl: WindowMove: WindowId:0x%lx at (%ld,%ld) %ldx%ld\n",
++		  window_id, left, top, right - left, bottom - top);
++
++	/* Same shape as a dispatched PDU; the callback frees it. */
++	data = xzalloc(sizeof(*data));
++	data->client = b->rdp_peer;
++	data->window_move.windowId = (UINT32)window_id;
++	data->window_move.left = (INT16)left;
++	data->window_move.top = (INT16)top;
++	data->window_move.right = (INT16)right;
++	data->window_move.bottom = (INT16)bottom;
++	rail_client_WindowMove_callback(false, &data->task_base);
++}
++
++static int
++rdp_rail_ctl_readable(int fd, uint32_t mask, void *arg)
++{
++	struct rdp_backend *b = arg;
++	ssize_t n;
++
++	assert_compositor_thread(b);
++
++	while ((n = read(fd, rail_ctl.buf + rail_ctl.len,
++			 sizeof(rail_ctl.buf) - 1 - rail_ctl.len)) > 0) {
++		char *start = rail_ctl.buf;
++		char *nl;
++
++		rail_ctl.len += n;
++		while ((nl = memchr(start, '\n', rail_ctl.buf + rail_ctl.len - start))) {
++			*nl = '\0';
++			if (nl > start && nl[-1] == '\r')
++				nl[-1] = '\0';
++			rdp_rail_ctl_handle_line(b, start);
++			start = nl + 1;
++		}
++		rail_ctl.len -= start - rail_ctl.buf;
++		memmove(rail_ctl.buf, start, rail_ctl.len);
++		if (rail_ctl.len >= sizeof(rail_ctl.buf) - 1)
++			rail_ctl.len = 0; /* line too long: drop it */
++	}
++
++	return 0;
++}
++
++static void
++rdp_rail_ctl_init(struct rdp_backend *b)
++{
++	const char *dir = getenv("XDG_RUNTIME_DIR");
++	struct wl_event_loop *loop;
++	struct stat st;
++
++	if (!dir || snprintf(rail_ctl.path, sizeof(rail_ctl.path), "%s/%s",
++			     dir, RDP_RAIL_CTL_FIFO_NAME) >= (int)sizeof(rail_ctl.path))
++		return;
++
++	if (lstat(rail_ctl.path, &st) == 0 && !S_ISFIFO(st.st_mode))
++		unlink(rail_ctl.path);
++	if (mkfifo(rail_ctl.path, 0600) < 0 && errno != EEXIST) {
++		rdp_debug_error(b, "wslg ctl: mkfifo(%s) failed: %s\n",
++				rail_ctl.path, strerror(errno));
++		return;
++	}
++	rail_ctl.fd = open(rail_ctl.path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++	if (rail_ctl.fd < 0) {
++		rdp_debug_error(b, "wslg ctl: open(%s) failed: %s\n",
++				rail_ctl.path, strerror(errno));
++		return;
++	}
++	loop = wl_display_get_event_loop(b->compositor->wl_display);
++	rail_ctl.source = wl_event_loop_add_fd(loop, rail_ctl.fd, WL_EVENT_READABLE,
++					       rdp_rail_ctl_readable, b);
++	if (!rail_ctl.source) {
++		close(rail_ctl.fd);
++		rail_ctl.fd = -1;
++		return;
++	}
++	rdp_debug(b, "RDP backend: wslg window control FIFO at %s\n", rail_ctl.path);
++}
++
++static void
++rdp_rail_ctl_destroy(void)
++{
++	if (rail_ctl.source)
++		wl_event_source_remove(rail_ctl.source);
++	rail_ctl.source = NULL;
++	if (rail_ctl.fd >= 0)
++		close(rail_ctl.fd);
++	rail_ctl.fd = -1;
++	/* keep the FIFO itself: writers may outlive this Weston */
++}
++
+ static void
+ rail_client_Syscommand_callback(bool freeOnly, void *arg)
+ {
+@@ -5026,12 +5174,16 @@
+ 	wl_signal_add(&b->compositor->create_surface_signal,
+ 		      &b->create_window_listener);
+ 
++	rdp_rail_ctl_init(b);
++
+ 	return 0;
+ }
+ 
+ void
+ rdp_rail_destroy(struct rdp_backend *b)
+ {
++	rdp_rail_ctl_destroy();
++
+ 	if (b->create_window_listener.notify) {
+ 		wl_list_remove(&b->create_window_listener.link);
+ 		b->create_window_listener.notify = NULL;

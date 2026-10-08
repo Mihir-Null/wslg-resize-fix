@@ -1,19 +1,21 @@
 <#
 .SYNOPSIS
   Make WSLg windows follow resizes done by external Windows WMs (LeopardWM,
-  komorebi, FancyZones, ...). Two halves:
-    * a patched Weston rdprail-shell.so (Linux side) that honours the size in
-      RDP "Client Window Move" PDUs instead of ignoring it, and
-    * wslg-resize-sync.exe (Windows side) that makes msrdc actually send that
-      PDU when something other than msrdc moves/resizes a WSLg window.
+  komorebi, FancyZones, ...). Three pieces:
+    * patched Weston rdprail-shell.so: honours the size in RDP "Client Window
+      Move" requests instead of ignoring it;
+    * patched Weston rdp-backend.so: accepts the same request as a text line on
+      the FIFO /mnt/wslg/runtime-dir/wslg-window-ctl;
+    * wslg-resize-sync.exe (Windows): watches msrdc's RAIL_WINDOWs and writes
+      a line to that FIFO whenever something other than msrdc moves/resizes one.
 
 .EXAMPLE
   .\wslg-fix.ps1 status
-  .\wslg-fix.ps1 build          # build patched shell (in WSLg system distro) + helper
-  .\wslg-fix.ps1 apply          # install patched shell, restart Weston (closes WSLg windows!)
+  .\wslg-fix.ps1 build          # build patched modules (in WSLg system distro) + helper
+  .\wslg-fix.ps1 apply          # install patched modules, restart Weston (closes WSLg windows!)
   .\wslg-fix.ps1 start          # run the helper in the background
   .\wslg-fix.ps1 stop
-  .\wslg-fix.ps1 revert         # stock shell back, restart Weston
+  .\wslg-fix.ps1 revert         # stock modules back, restart Weston
   # full reset at any time: wsl --shutdown  (system distro changes are not persistent)
 #>
 param(
@@ -46,22 +48,28 @@ function Build-Shell {
   Write-Host "== weston $commit"
   # The system distro's CA bundle can't verify github.com: fetch from the user distro.
   User "mkdir -p cache && [ -s cache/weston-$commit.tar.gz ] || curl -sSfL -o cache/weston-$commit.tar.gz https://github.com/microsoft/weston-mirror/archive/$commit.tar.gz"
-  # Long-running: detach inside the system distro and poll the log.
-  Sys "setsid nohup bash $RepoFromSystem/linux/build-shell.sh > /tmp/wslg-build.log 2>&1 < /dev/null & echo started"
+  # Long-running: detach inside the system distro and poll the log. (Keep the
+  # launching session alive a moment: a detached job started by a wsl.exe
+  # session that exits immediately was observed to never run.)
+  Sys "setsid nohup bash $RepoFromSystem/linux/build-shell.sh > /tmp/wslg-build.log 2>&1 < /dev/null & sleep 3; echo started"
   do {
     Start-Sleep 5
     $tail = wsl.exe -d $Distro --system -u root --exec bash -c 'grep -v NOKEY /tmp/wslg-build.log | tail -1'
     Write-Host "   $tail"
-    $running = wsl.exe -d $Distro --system -u root --exec bash -c 'pgrep -f build-shell.sh >/dev/null && echo y || echo n'
+    $running = wsl.exe -d $Distro --system -u root --exec bash -c 'pgrep -f "[b]uild-shell.sh" >/dev/null && echo y || echo n'
   } while ($running -eq 'y')
   $ok = wsl.exe -d $Distro --system -u root --exec bash -c 'grep -q "^== done" /tmp/wslg-build.log && echo y || echo n'
   if ($ok -ne 'y') { wsl.exe -d $Distro --system -u root --exec tail -30 /tmp/wslg-build.log; throw 'shell build failed' }
-  # Copy the artifact into the repo (system distro sees the repo read-only).
-  $b64 = wsl.exe -d $Distro --system -u root --exec base64 -w0 /tmp/wslg-out/rdprail-shell.so
+  wsl.exe -d $Distro --system -u root --exec bash -c 'grep -E "^(==|!!|   )" /tmp/wslg-build.log' | Write-Host
+  # Copy the artifacts into the repo (system distro sees the repo read-only),
+  # so 'apply' still works after a WSL restart without rebuilding.
   New-Item -ItemType Directory -Force (Join-Path $RepoUnc 'out') | Out-Null
-  [IO.File]::WriteAllBytes((Join-Path $RepoUnc 'out\rdprail-shell.so'), [Convert]::FromBase64String($b64))
+  foreach ($m in 'rdprail-shell.so', 'rdp-backend.so') {
+    $b64 = wsl.exe -d $Distro --system -u root --exec base64 -w0 "/tmp/wslg-out/$m"
+    [IO.File]::WriteAllBytes((Join-Path $RepoUnc "out\$m"), [Convert]::FromBase64String($b64))
+  }
   [IO.File]::WriteAllText((Join-Path $RepoUnc 'out\weston-commit'), "$commit`n")
-  Write-Host "== out\rdprail-shell.so (weston $commit)"
+  Write-Host "== out\{rdprail-shell,rdp-backend}.so (weston $commit)"
 }
 
 function Build-Helper {
@@ -94,8 +102,8 @@ switch ($Cmd) {
   'start' {
     if (-not (Test-Path $Exe)) { Build-Helper }
     Stop-Helper
-    $sp = @{ FilePath = $Exe; WindowStyle = 'Hidden'; RedirectStandardError = $Log; PassThru = $true }
-    if ($Trace) { $sp.ArgumentList = '-v' }
+    $hargs = @('-d', $Distro); if ($Trace) { $hargs += '-v' }
+    $sp = @{ FilePath = $Exe; ArgumentList = $hargs; WindowStyle = 'Hidden'; RedirectStandardError = $Log; PassThru = $true }
     $p = Start-Process @sp
     Write-Host "helper started, pid $($p.Id) (log: $Log)"
   }
