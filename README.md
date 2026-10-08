@@ -190,14 +190,25 @@ run it again.
 * **Popups must never be moved through the control FIFO.** Weston's
   `shell_backend_request_window_move()` dereferenced a NULL shell surface for
   them (upstream bug; msrdc never sends that request for popups, so stock WSLg
-  doesn't hit it). Patch 0001 now returns early, and the helper only syncs
-  windows with the ` (<distro>)` title suffix.
-* **`[WARN:COPY MODE]` after WSLg restarts inside a running WSL VM.** When the
-  distro (and with it WSLg) restarts while the VM keeps running, Weston can fail
-  to open WSLg's shared memory (`rdp_allocate_shared_memory: … Input/output
-  error`) and falls back to copying frames. A fresh VM (`wsl --shutdown`, or a
-  Windows restart) has not shown it. This code path is untouched by these
-  patches, but it is not yet confirmed whether stock WSLg behaves the same.
+  doesn't hit it). Patch 0001 now returns early (proposed upstream on its own
+  as [weston-mirror#177](https://github.com/microsoft/weston-mirror/pull/177)),
+  and the helper only syncs windows with the ` (<distro>)` title suffix.
+* **`[WARN:COPY MODE]` after WSLg restarts inside a running WSL VM** is a WSL
+  issue, not caused by this fix. When the distro (and with it WSLg) restarts
+  while the VM keeps running (`wsl --terminate`, or the distro idling out),
+  Weston fails to open WSLg's shared memory (`rdp_allocate_shared_memory: …
+  Input/output error`, then `use_gfxredir = 0`) and falls back to copying
+  frames. Stock WSLg 1.0.73.2 does exactly the same:
+
+  | modules | restart | `use_gfxredir` |
+  |---|---|---|
+  | patched | in-VM (`wsl --terminate NixOS`) | 0 (copy mode) |
+  | stock | in-VM | 0 (copy mode) |
+  | stock | fresh VM (`wsl --shutdown`) | 1 |
+  | patched | fresh VM | 1 |
+  | patched | first in-VM restart after a fresh boot | 0 (copy mode) |
+
+  `wsl --shutdown` (or a Windows restart) brings shared memory back.
 * **Apps that size in character cells** (Emacs, xterm) end up slightly smaller
   than their tile. For Emacs: `(setq frame-resize-pixelwise t)`.
 * After a Weston crash, WSLGd's relaunches crash-loop on a stale Xwayland
