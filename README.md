@@ -64,7 +64,7 @@ helper, and a window manager that tiles WSLg windows (LeopardWM needs
 cd \\wsl.localhost\<distro>\path\to\wslg-resize-fix   # or a Windows checkout
 Set-ExecutionPolicy -Scope Process Bypass   # this window only: \\wsl.localhost paths count as "remote"
 .\wslg-fix.ps1 build       # patched modules + shims for the running WSLg, and the helper
-.\wslg-fix.ps1 install     # files -> %LOCALAPPDATA%\wslg-resize-fix, .wslgconfig entry, logon task
+.\wslg-fix.ps1 install     # files -> %LOCALAPPDATA%\wslg-resize-fix, .wslgconfig entries, logon task
 wsl --shutdown             # WSLg picks it up at the next start (closes all WSL sessions)
 .\wslg-fix.ps1 status
 ```
@@ -73,16 +73,22 @@ wsl --shutdown             # WSLg picks it up at the next start (closes all WSL 
 
 1. copies the shims and `weston-<commit>\` builds to `%LOCALAPPDATA%\wslg-resize-fix\modules`
    and the helper to `…\bin`;
-2. adds one line to `%USERPROFILE%\.wslgconfig`, which WSLGd reads at start and
-   exports to Weston:
+2. adds two settings to `%USERPROFILE%\.wslgconfig`, which WSLGd reads at start
+   and exports to Weston:
    ```ini
    [system-distro-env]
    ; added by wslg-resize-fix (wslg-fix.ps1 uninstall removes it)
    WESTON_MODULE_MAP=rdp-backend.so=/mnt/c/Users/<you>/AppData/Local/wslg-resize-fix/modules/rdp-backend.so;rdprail-shell.so=…/rdprail-shell.so
+   ; added by wslg-resize-fix (wslg-fix.ps1 uninstall removes it)
+   WESTON_RDP_WINDOW_SHADOW_REMOTING=false
    ```
    `WESTON_MODULE_MAP` is libweston's own module-path override; WSLGd hard-codes
    `--backend=rdp-backend.so --shell=rdprail-shell.so`, and the map redirects
-   those names to the shims;
+   those names to the shims. `WESTON_RDP_WINDOW_SHADOW_REMOTING=false` is a
+   stock WSLg option that keeps each window's drop-shadow margin out of the
+   Windows window, so tiled windows fill their tiles (see
+   [Window shadows](#window-shadows)); `install -KeepShadow` leaves it out, and a
+   value you set yourself is left alone;
 3. registers a per-user logon task running the windowless helper
    (`wslg-resize-syncw.exe --log %LOCALAPPDATA%\wslg-resize-fix\wslg-resize-sync.log`).
 
@@ -116,6 +122,8 @@ is installed.)
 ```powershell
 .\wslg-fix.ps1 uninstall; wsl --shutdown; .\wslg-fix.ps1 uninstall -Purge   # -Purge deletes the files
 ```
+
+`uninstall` removes both settings (only the ones it added).
 
 If WSLg ever fails to start, removing the `WESTON_MODULE_MAP` line from
 `%USERPROFILE%\.wslgconfig` and running `wsl --shutdown` restores stock WSLg.
@@ -161,6 +169,26 @@ An earlier version made msrdc send the PDU itself by posting `SC_MOVE` + →, �
 It worked, but the move loop activated the window (focus steal), and WMs saw
 `EVENT_SYSTEM_MOVESIZESTART/END` and reacted (LeopardWM treated it as a user
 resize-snap). The FIFO replaced that.
+
+### Window shadows
+
+Weston draws the title bar and border of X11 apps itself, inside a 32 px
+transparent margin for the drop shadow, and by default WSLg sends that margin to
+Windows as part of the window. msrdc's windows are layered (per-pixel alpha), with
+no window region, and `DWMWA_EXTENDED_FRAME_BOUNDS` equals the window rect, so a
+tiling WM has no way to see the margin: it sizes the shadow, and the visible
+window sits 32 px inside its tile on every side.
+
+With `WESTON_RDP_WINDOW_SHADOW_REMOTING=false` the backend clips the shadow
+(`is_window_shadow_remoting_disabled()` in `rdprail.c`) and tells msrdc to use a
+resize margin instead, so the Windows window is the visible window plus an 8 px
+border (`RDP_RAIL_WINDOW_RESIZE_MARGIN`) for resizing with the mouse. Measured on
+a LeopardWM tile: 31 px gap before, 7–8 px after. Window moves stay correct: the
+backend adds the margins back before calling the shell, so patch 0001 sees the
+same full-surface sizes either way. The remaining 8 px are the same thing as
+Windows' own invisible resize borders, except that native windows report theirs
+through DWM and msrdc's don't; taking them to 0 would mean patching the backend
+and losing mouse resizing.
 
 ## LeopardWM
 
@@ -209,8 +237,12 @@ run it again.
   | patched | first in-VM restart after a fresh boot | 0 (copy mode) |
 
   `wsl --shutdown` (or a Windows restart) brings shared memory back.
-* **Apps that size in character cells** (Emacs, xterm) end up slightly smaller
-  than their tile. For Emacs: `(setq frame-resize-pixelwise t)`.
+* **An 8 px gap stays between a tiled WSLg window and its tile**, evenly on
+  all sides: WSLg's mouse-resize border, which Windows can't report (see
+  [Window shadows](#window-shadows)). Without the shadow setting the gap is 32 px.
+* **Apps that size in character cells** (Emacs, xterm) can also stop short of
+  the right and bottom edges by up to one cell. For Emacs:
+  `(setq frame-resize-pixelwise t)`.
 * After a Weston crash, WSLGd's relaunches crash-loop on a stale Xwayland
   socket (upstream; see `debug/NOTES.md`) and it gives up after 10 tries:
   `wsl --shutdown` recovers.
