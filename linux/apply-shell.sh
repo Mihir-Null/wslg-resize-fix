@@ -26,7 +26,8 @@ status() {
   echo "WSLg:    $(awk '/^WSLg/{print $NF}' /mnt/wslg/versions.txt)   weston $(running_commit)"
   echo "module:  $(sha256sum "$MOD" | cut -c1-16)…  ($MOD)"
   if [ -f "$BACKUP" ]; then
-    if cmp -s "$MOD" "$BACKUP"; then echo "state:   STOCK (backup present at $BACKUP)"
+    # (no cmp(1) in the system distro)
+    if [ "$(sha256sum < "$MOD")" = "$(sha256sum < "$BACKUP")" ]; then echo "state:   STOCK (backup present at $BACKUP)"
     else echo "state:   PATCHED (stock copy saved at $BACKUP)"; fi
   else
     echo "state:   STOCK (never patched this boot)"
@@ -38,6 +39,14 @@ restart_weston() {
   local old; old="$(pgrep -x weston || true)"
   [ -n "$old" ] || { echo "weston not running; WSLGd will load the module on next start"; return; }
   echo "== restarting weston (pid $old); WSLGd will relaunch it"
+  # Weston leaves Xwayland's /tmp/.X11-unix/X0 behind when it is killed; the
+  # relaunched instance then fails to bind it, exits, and segfaults in upstream
+  # Xwayland teardown (wl_event_source_remove(NULL)) -> WSLGd crash-loops and
+  # gives up (needs `wsl --shutdown`). Unlink socket + lock *before* signalling:
+  # the dying instance doesn't care, and WSLGd relaunches faster than we could
+  # clean up afterwards. Weston's own wayland-0 socket is lock-protected and
+  # rebinds fine.
+  rm -f /tmp/.X11-unix/X0 /tmp/.X0-lock
   kill -TERM "$old"
   for _ in $(seq 1 50); do
     sleep 0.2
@@ -51,7 +60,6 @@ restart_weston() {
 case "$ACTION" in
   status) status ;;
   apply)
-    [ "${FORCE_APPLY:-0}" = 1 ] || { echo "!! patched module currently crashes Weston (see README STATUS); set FORCE_APPLY=1 to override" >&2; exit 1; }
     if [ -z "$SRC" ]; then
       for c in /tmp/wslg-out/rdprail-shell.so "$HERE/out/rdprail-shell.so"; do [ -f "$c" ] && { SRC="$c"; break; }; done
     fi
