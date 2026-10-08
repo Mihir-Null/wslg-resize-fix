@@ -59,7 +59,10 @@ done
 
 # 4. Exact weston source + our patch.
 SRC="$BR/work/weston"
-if [ ! -f "$SRC/.commit" ] || [ "$(cat "$SRC/.commit")" != "$WESTON_COMMIT" ]; then
+# The unpacked source is reused while both the commit and the patch set are
+# unchanged; a new or edited patch means a fresh unpack.
+STAMP="$WESTON_COMMIT $(cat "$HERE"/patches/*.patch | sha256sum | cut -c1-16)"
+if [ ! -f "$SRC/.commit" ] || [ "$(cat "$SRC/.commit")" != "$STAMP" ]; then
   # The system distro's CA bundle can't verify github.com, so the tarball is
   # fetched from the user distro first (wslg-fix.ps1 build does this) into cache/.
   # Either a source directory (the flake passes a pinned Nix store path, seen
@@ -82,7 +85,7 @@ if [ ! -f "$SRC/.commit" ] || [ "$(cat "$SRC/.commit")" != "$WESTON_COMMIT" ]; t
     echo "   applying $(basename "$p")"
     chroot "$BR" patch -d /work/weston -p1 --forward < "$p"
   done
-  echo "$WESTON_COMMIT" > "$SRC/.commit"
+  echo "$STAMP" > "$SRC/.commit"
 fi
 
 # 5. Configure with WSLg's own meson flags (from microsoft/wslg Dockerfile) so

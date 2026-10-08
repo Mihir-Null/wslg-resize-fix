@@ -9,6 +9,7 @@
   build-helper   only the Windows helper (needs cargo)
   install        install what 'build' produced, point WSLg at it (%USERPROFILE%\.wslgconfig),
                  drop the shadow margin around X11 window frames (-KeepShadow leaves it),
+                 with -NoFrames also drop the frames themselves (patch 0004),
                  register + start the helper logon task. Takes effect at the next WSL start.
   uninstall      undo 'install' (-Purge also deletes installed files once WSL is shut down)
   status         what is installed, which WSLg is running, what its Weston loaded
@@ -30,7 +31,8 @@ param(
   [switch]$Trace,      # start: helper logs every WinEvent
   [switch]$Purge,      # uninstall: also delete installed modules/helper
   [switch]$Force,      # install: replace changed files even while WSL is running
-  [switch]$KeepShadow  # install: keep the 32 px shadow margin around X11 window frames
+  [switch]$KeepShadow, # install: keep the 32 px shadow margin around X11 window frames
+  [switch]$NoFrames    # install: no title bar/border on any X11 window (moving/resizing left to Windows)
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
@@ -52,6 +54,9 @@ $Shims = @('rdp-backend.so', 'rdprail-shell.so', 'xwayland.so')   # module names
 # patched xwayland.so (patches/0003) reads this; 0 means no shadow margin.
 $ShadowKey = 'WESTON_XWM_SHADOW_MARGIN'
 $ShadowValue = '0'
+# Patch 0004 (personal, not proposed upstream): '0' draws no frame at all around
+# X11 windows. Only set with install -NoFrames; a plain install removes ours.
+$FramesKey = 'WESTON_XWM_DECORATIONS'
 $CfgComment = '; added by wslg-resize-fix (wslg-fix.ps1 uninstall removes it)'
 
 # Where is the repo, as seen from inside WSL?
@@ -190,8 +195,14 @@ function Build-Helper {
 
 # --- helper process / logon task --------------------------------------------------------
 function Stop-Helper {
-  Get-Process wslg-resize-sync, wslg-resize-syncw -ErrorAction SilentlyContinue |
-    ForEach-Object { Stop-Process -Id $_.Id; Write-Host "stopped helper pid $($_.Id)" }
+  # Stop the logon task first: it restarts a helper that exits abnormally, and a
+  # killed one would be back (holding its .exe open) before install copies it.
+  if ((Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State -eq 'Running') {
+    Stop-ScheduledTask -TaskName $TaskName
+  }
+  $p = @(Get-Process wslg-resize-sync, wslg-resize-syncw -ErrorAction SilentlyContinue)
+  foreach ($h in $p) { Stop-Process -Id $h.Id -ErrorAction SilentlyContinue; Write-Host "stopped helper pid $($h.Id)" }
+  if ($p) { $p | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue }
 }
 function Start-Helper {
   Stop-Helper
@@ -239,7 +250,10 @@ function Install-Fix {
 
   Stop-Helper
   New-Item -ItemType Directory -Force $Bin | Out-Null
-  Copy-Item (Join-Path $Dist 'bin\*.exe') $Bin -Force
+  foreach ($e in Get-ChildItem (Join-Path $Dist 'bin') -Filter *.exe) {
+    $dst = Join-Path $Bin $e.Name
+    if (-not (Same-File $e.FullName $dst)) { Copy-Item $e.FullName $dst -Force; Write-Host "   installed $dst" }
+  }
 
   $l = To-Wsl $Inst
   $map = ($Shims | ForEach-Object { "$_=$l/$_" }) -join ';'
@@ -256,6 +270,13 @@ function Install-Fix {
     Write-Host "== $Cfg [$CfgSection] $ShadowKey=$ShadowValue (no shadow margin around X11 window frames)"
   } elseif (-not $sh.Ours) {
     Write-Host "   $ShadowKey=$($sh.Value) is already set in $Cfg; left alone"
+  }
+  $fr = Get-CfgEntry $FramesKey
+  if ($NoFrames) {
+    if (-not $fr) { Set-CfgValue '0' $FramesKey; Write-Host "== $Cfg [$CfgSection] $FramesKey=0 (no frames around X11 windows)" }
+    elseif (-not $fr.Ours) { Write-Host "   $FramesKey=$($fr.Value) is already set in $Cfg; left alone" }
+  } elseif ($fr -and $fr.Ours) {
+    Set-CfgValue $null $FramesKey; Write-Host "== removed $FramesKey from $Cfg (install without -NoFrames)"
   }
 
   $action = New-ScheduledTaskAction -Execute (Join-Path $Bin 'wslg-resize-syncw.exe') -Argument "--log `"$Log`""
@@ -285,6 +306,8 @@ function Uninstall-Fix {
   elseif ($cur) { Write-Warning "$Cfg sets $CfgKey=$cur, which is not ours; left alone" }
   $sh = Get-CfgEntry $ShadowKey
   if ($sh -and $sh.Ours) { Set-CfgValue $null $ShadowKey; Write-Host "== removed $ShadowKey from $Cfg" }
+  $fr = Get-CfgEntry $FramesKey
+  if ($fr -and $fr.Ours) { Set-CfgValue $null $FramesKey; Write-Host "== removed $FramesKey from $Cfg" }
   if ($Purge) {
     if (Wsl-Running) {
       Write-Warning "WSL is running and its Weston may still use the installed shims: run 'wsl --shutdown', then '.\wslg-fix.ps1 uninstall -Purge' again."
@@ -304,6 +327,9 @@ function Show-Status {
   $sh = Get-CfgEntry $ShadowKey
   $shLive = "$(SysOut 'grep -ho "XWM: frame shadow margin [0-9]* px" /mnt/wslg/weston.log 2>/dev/null | tail -1')".Trim()
   Write-Host ("shadows:    " + $(if ($sh) { "$ShadowKey=$($sh.Value)$(if (-not $sh.Ours) { ' (set by you)' })" } else { 'default (32 px shadow margin around X11 frames)' }) + $(if ($shLive) { "; running Weston: $shLive" }))
+  $fr = Get-CfgEntry $FramesKey
+  $frLive = "$(SysOut 'grep -ho "XWM: window decorations disabled" /mnt/wslg/weston.log 2>/dev/null | tail -1')".Trim()
+  Write-Host ("frames:     " + $(if ($fr) { "$FramesKey=$($fr.Value)$(if (-not $fr.Ours) { ' (set by you)' })" } else { 'drawn (default)' }) + $(if ($frLive) { "; running Weston: decorations disabled" }))
   $have = @(Get-ChildItem $Inst -Directory -Filter 'weston-*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name.Substring(7, 12) })
   Write-Host ("installed:  " + $(if ($have) { ($have -join ', ') + $(if ($have -contains $commit.Substring(0, 12)) { '  (matches running WSLg)' } else { '  (NONE for the running WSLg: rebuild)' }) } else { 'no modules' }))
   $loaded = SysOut 'grep -h "wslg-resize-fix:" /mnt/wslg/weston.log 2>/dev/null | tail -2'

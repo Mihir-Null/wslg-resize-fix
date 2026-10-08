@@ -48,6 +48,7 @@ lives in Weston (`rdp-backend` + `rdprail-shell`) inside the WSLg system distro.
 | [`patches/0001`](patches/0001-rdprail-shell-honor-client-window-move-size.patch) | `rdprail-shell.so` | implement the TODO: same size conversion and min/max clamp as the snap path; skip maximized/fullscreen; apply the new position together with the resized buffer (250 ms fallback) so msrdc never sees "new position, old size" (proposed upstream as-is) |
 | [`patches/0002`](patches/0002-rdp-backend-window-control-fifo.patch) | `rdp-backend.so` | control FIFO `$XDG_RUNTIME_DIR/wslg-window-ctl`; each `move <id-hex> <l> <t> <r> <b>` line goes to the **unmodified** Client Window Move handler |
 | [`patches/0003`](patches/0003-xwayland-configurable-frame-shadow-margin.patch) | `xwayland.so` | `WESTON_XWM_SHADOW_MARGIN`: the transparent shadow margin around X11 window frames (default 32 px); `install` sets 0, so a tiled X11 window fills its tile instead of sitting 32 px inside it (see [Window shadows](#window-shadows); proposed upstream as [weston-mirror#178](https://github.com/microsoft/weston-mirror/pull/178)) |
+| [`patches/0004`](patches/0004-xwayland-optional-no-decorations.patch) | `xwayland.so` | **personal, not proposed upstream.** `WESTON_XWM_DECORATIONS=0` draws no title bar or border around any X11 window, as if each had asked for none; moving and resizing are left to the Windows side. Off unless `install -NoFrames` |
 | [`shim/shim.c`](shim/shim.c) | all three | loaded in place of the stock modules; picks `weston-<commit>/<module>` for the running WSLg, **else the stock module** |
 | [`helper/`](helper/src/app.rs) | Windows | watches msrdc's windows; when something other than msrdc/Weston moved one, writes its rect to that distro's FIFO |
 
@@ -87,7 +88,11 @@ wsl --shutdown             # WSLg picks it up at the next start (closes all WSL 
    `--backend=rdp-backend.so --shell=rdprail-shell.so` and libweston loads
    `xwayland.so` by name, and the map redirects those names to the shims.
    `WESTON_XWM_SHADOW_MARGIN=0` is read by patch 0003 (stock modules ignore it);
-   `install -KeepShadow` leaves it out, and a value you set yourself is left alone;
+   `install -KeepShadow` leaves it out, and a value you set yourself is left alone.
+   `install -NoFrames` also adds `WESTON_XWM_DECORATIONS=0` (patch 0004: no
+   frames at all on X11 windows); a later plain `install` takes it out again.
+   For one app instead, ask it for an undecorated window (Emacs:
+   `(push '(undecorated . t) default-frame-alist)`);
 3. registers a per-user logon task running the windowless helper
    (`wslg-resize-syncw.exe --log %LOCALAPPDATA%\wslg-resize-fix\wslg-resize-sync.log`).
 
@@ -122,7 +127,7 @@ is installed.)
 .\wslg-fix.ps1 uninstall; wsl --shutdown; .\wslg-fix.ps1 uninstall -Purge   # -Purge deletes the files
 ```
 
-`uninstall` removes both settings (only the ones it added).
+`uninstall` removes these settings (only the ones it added).
 
 If WSLg ever fails to start, removing the `WESTON_MODULE_MAP` line from
 `%USERPROFILE%\.wslgconfig` and running `wsl --shutdown` restores stock WSLg.

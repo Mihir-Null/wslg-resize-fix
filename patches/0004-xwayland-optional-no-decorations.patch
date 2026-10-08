@@ -1,0 +1,52 @@
+--- a/xwayland/window-manager.c
++++ b/xwayland/window-manager.c
+@@ -205,6 +205,12 @@
+ xserver_map_shell_surface(struct weston_wm_window *window,
+ 			  struct weston_surface *surface);
+ 
++/* WESTON_XWM_DECORATIONS=0 (or false): no frame at all around X11 windows,
++ * as if each had asked for none through _MOTIF_WM_HINTS. For a client whose
++ * own window manager already frames and places every window; see
++ * weston_wm_read_decorations_setting(). */
++static bool xwm_decorations_disabled;
++
+ static bool
+ wm_debug_is_enabled(struct weston_wm *wm)
+ {
+@@ -699,6 +705,9 @@
+ 		free(reply);
+ 	}
+ 
++	if (xwm_decorations_disabled)
++		window->decorate = 0;
++
+ 	if (window->pid > 0) {
+ 		gethostname(name, sizeof(name));
+ 		for (i = 0; i < sizeof(name); i++) {
+@@ -2920,6 +2929,18 @@
+ 	weston_log("XWM: frame shadow margin %ld px (WESTON_XWM_SHADOW_MARGIN)\n", margin);
+ }
+ 
++/* No title bar, border or buttons on any X11 window: moving and resizing are
++ * left to the client's window manager (e.g. a Windows tiling WM). */
++static void
++weston_wm_read_decorations_setting(void)
++{
++	const char *s = getenv("WESTON_XWM_DECORATIONS");
++
++	xwm_decorations_disabled = s && (!strcmp(s, "0") || !strcmp(s, "false"));
++	if (xwm_decorations_disabled)
++		weston_log("XWM: window decorations disabled (WESTON_XWM_DECORATIONS)\n");
++}
++
+ static void
+ weston_wm_create_wm_window(struct weston_wm *wm)
+ {
+@@ -3029,6 +3050,7 @@
+ 
+ 	wm->theme = theme_create();
+ 	weston_wm_apply_shadow_margin(wm->theme);
++	weston_wm_read_decorations_setting();
+ 
+ 	supported[0] = wm->atom.net_wm_moveresize;
+ 	supported[1] = wm->atom.net_wm_state;
