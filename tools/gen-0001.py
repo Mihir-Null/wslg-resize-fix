@@ -80,6 +80,23 @@ shell_surface_client_move_timeout(void *data)
 static void
 desktop_surface_committed(struct weston_desktop_surface *desktop_surface,""")
 
+# 4a. Client Window Move for a surface without a shell surface (a popup,
+#     menu or tooltip) used to dereference NULL. msrdc never sends one, but
+#     anything that moves a popup's RAIL window (e.g. a window manager plus a
+#     forwarder) crashed Weston.
+sub("""	view = get_default_view(surface);
+	if (!view)
+		return;
+
+	if (shsurf && shsurf->shell->is_localmove_pending) {""",
+"""	view = get_default_view(surface);
+	/* Only shell surfaces (toplevels) can be moved this way; a request for
+	 * a popup would otherwise dereference a NULL shsurf below. */
+	if (!view || !shsurf)
+		return;
+
+	if (shsurf->shell->is_localmove_pending) {""")
+
 # 4. the request handler itself
 sub("""	if (surface->width != width || surface->height != height) {
 		//TODO: support window resize (width x height)

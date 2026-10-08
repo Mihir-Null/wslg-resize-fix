@@ -205,7 +205,14 @@ function Install-Fix {
     $src = Join-Path $Dist $f; $dst = Join-Path $Inst $f
     if (Same-File $src $dst) { continue }
     if ((Test-Path $dst) -and $running -and -not $Force) {
-      throw "$dst differs from the new build and WSL is running (Weston may have it loaded). Run 'wsl --shutdown' first, or pass -Force."
+      # Running this script from \\wsl.localhost\... itself boots WSL, so hand
+      # over a local copy that can run after the shutdown.
+      $local = Join-Path $Root 'wslg-fix.ps1'
+      New-Item -ItemType Directory -Force $Root | Out-Null
+      Copy-Item $PSCommandPath $local -Force
+      throw ("$dst differs from the new build and WSL is running (Weston may have it loaded).`n" +
+        "Run from a local copy (reading this script from \\wsl.localhost starts WSL again):`n" +
+        "    wsl --shutdown; & '$local' install")
     }
     $copies += , @($src, $dst)
   }

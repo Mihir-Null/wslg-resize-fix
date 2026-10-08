@@ -69,7 +69,20 @@
  	if (sx == 0 && sy == 0 &&
  	    shsurf->last_width == surface->width &&
  	    shsurf->last_height == surface->height &&
-@@ -3081,12 +3122,60 @@
+@@ -3072,21 +3113,71 @@
+ 	struct shell_surface *shsurf = get_shell_surface(surface);
+ 
+ 	view = get_default_view(surface);
+-	if (!view)
++	/* Only shell surfaces (toplevels) can be moved this way; a request for
++	 * a popup would otherwise dereference a NULL shsurf below. */
++	if (!view || !shsurf)
+ 		return;
+ 
+-	if (shsurf && shsurf->shell->is_localmove_pending) {
++	if (shsurf->shell->is_localmove_pending) {
+ 		shsurf->shell->is_localmove_pending = false;
+ 	}
  
  	assert(!shsurf->snapped.is_maximized_requested);
  

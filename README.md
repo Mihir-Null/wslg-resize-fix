@@ -166,8 +166,43 @@ resize-snap). The FIFO replaced that.
 
 LeopardWM hard-skips `RAIL_WINDOW` (`crates/platform_win32/src/enumeration.rs`,
 "tiling breaks them because the remote session controls sizing", i.e. this
-bug) before user `window_rules` are consulted. Tiling WSLg windows needs a
-build with that entry removed ([`patches/leopardwm/`](patches/leopardwm/)).
+bug) before user `window_rules` are consulted.
+[`patches/leopardwm/leopardwm-allow-rail.patch`](patches/leopardwm/leopardwm-allow-rail.patch)
+keeps that skip but admits WSLg **top-level** windows: those titled
+`<title> (<distro>)`. WSLg popups, menus and tooltips are untitled
+`RAIL_WINDOW`s with exactly the same styles, so the title is the only thing
+that tells them apart; tiling one of those is wrong (and, combined with the
+helper, used to crash Weston; see below).
+
+```powershell
+.\patches\leopardwm\patch-leopardwm.ps1            # build for the installed version, swap into Program Files (one UAC prompt)
+.\patches\leopardwm\patch-leopardwm.ps1 -Status
+.\patches\leopardwm\patch-leopardwm.ps1 -Revert    # original binaries back
+```
+
+It replaces the binaries in place (originals kept in `bin\unpatched-<version>`)
+because `lwm start`/`restart` launch the daemon from the CLI's own folder, which
+is on the machine `PATH`. A LeopardWM update brings back unpatched binaries:
+run it again.
+
+## Known issues
+
+* **Popups must never be moved through the control FIFO.** Weston's
+  `shell_backend_request_window_move()` dereferenced a NULL shell surface for
+  them (upstream bug; msrdc never sends that request for popups, so stock WSLg
+  doesn't hit it). Patch 0001 now returns early, and the helper only syncs
+  windows with the ` (<distro>)` title suffix.
+* **`[WARN:COPY MODE]` after WSLg restarts inside a running WSL VM.** When the
+  distro (and with it WSLg) restarts while the VM keeps running, Weston can fail
+  to open WSLg's shared memory (`rdp_allocate_shared_memory: … Input/output
+  error`) and falls back to copying frames. A fresh VM (`wsl --shutdown`, or a
+  Windows restart) has not shown it. This code path is untouched by these
+  patches, but it is not yet confirmed whether stock WSLg behaves the same.
+* **Apps that size in character cells** (Emacs, xterm) end up slightly smaller
+  than their tile. For Emacs: `(setq frame-resize-pixelwise t)`.
+* After a Weston crash, WSLGd's relaunches crash-loop on a stale Xwayland
+  socket (upstream; see `debug/NOTES.md`) and it gives up after 10 tries:
+  `wsl --shutdown` recovers.
 
 ## Development
 
