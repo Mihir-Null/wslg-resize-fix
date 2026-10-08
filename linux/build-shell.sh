@@ -14,7 +14,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # repo root (seen via /mnt/wslg/distro)
 BR="${BR:-/tmp/wslg-buildroot}"                    # throwaway Azure Linux build root
-OUT="${OUT:-/tmp/wslg-out}"   # /mnt/wslg/distro is read-only from here; wslg-fix.ps1 copies it into the repo
+OUT="${OUT:-/tmp/wslg-out}"   # /mnt/wslg/distro is read-only from here; wslg-fix.ps1 copies OUT out
+# OUT layout (what gets installed):
+#   OUT/rdp-backend.so, OUT/rdprail-shell.so   version-checking shims (shim/shim.c)
+#   OUT/weston-<commit>/{rdp-backend,rdprail-shell}.so   patched modules for that WSLg
 JOBS="${JOBS:-$(nproc)}"
 
 # 1. Which weston commit is this WSLg built from? (recorded by WSLg itself)
@@ -59,11 +62,20 @@ SRC="$BR/work/weston"
 if [ ! -f "$SRC/.commit" ] || [ "$(cat "$SRC/.commit")" != "$WESTON_COMMIT" ]; then
   # The system distro's CA bundle can't verify github.com, so the tarball is
   # fetched from the user distro first (wslg-fix.ps1 build does this) into cache/.
+  # Either a source directory (the flake passes a pinned Nix store path, seen
+  # through /mnt/wslg/distro) or a tarball fetched in the user distro: the
+  # system distro's CA bundle can't verify github.com.
   TARBALL="$HERE/cache/weston-$WESTON_COMMIT.tar.gz"
-  [ -s "$TARBALL" ] || { echo "missing $TARBALL — fetch it from the user distro first" >&2; exit 1; }
-  echo "== unpacking weston-mirror@$WESTON_COMMIT"
   rm -rf "$SRC"; mkdir -p "$SRC"
-  tar -xzf "$TARBALL" -C "$SRC" --strip-components=1
+  if [ -n "${WESTON_SRC:-}" ] && [ -d "$WESTON_SRC" ]; then
+    echo "== copying weston-mirror@$WESTON_COMMIT from $WESTON_SRC"
+    cp -r "$WESTON_SRC"/. "$SRC"/; chmod -R u+w "$SRC"
+  elif [ -s "$TARBALL" ]; then
+    echo "== unpacking weston-mirror@$WESTON_COMMIT"
+    tar -xzf "$TARBALL" -C "$SRC" --strip-components=1
+  else
+    echo "no weston source: set WESTON_SRC or fetch $TARBALL in the user distro" >&2; exit 1
+  fi
   # upstream rdprail-shell sources use CRLF; normalise so the patch applies
   sed -i 's/\r$//' "$SRC/rdprail-shell/shell.c" "$SRC/libweston/backend-rdp/rdprail.c"
   for p in "$HERE"/patches/*.patch; do
@@ -94,13 +106,16 @@ chroot "$BR" /bin/bash -euo pipefail -c "
 # 6. Publish results, tagged with the commit they are valid for, and check
 #    each imports exactly what the stock module does (libexec_weston etc.
 #    resolve via $ORIGIN once installed next to the originals).
-mkdir -p "$OUT" "$BR/live"
+MODDIR="$OUT/weston-$WESTON_COMMIT"
+# Only our own outputs are cleared (OUT may be a caller-provided directory).
+rm -rf "$OUT"/weston-* "$OUT"/rdp-backend.so "$OUT"/rdprail-shell.so "$OUT"/weston-commit "$OUT"/wslg-version
+mkdir -p "$MODDIR" "$BR/live"
 publish() {  # <build-relative path> <live path>
   local rel="$1" live="$2" name lib d; name="$(basename "$rel")"
   chroot "$BR" strip --strip-debug "/work/weston/build/$rel" -o "/work/$name"
-  cp "$BR/work/$name" "$OUT/$name"
+  cp "$BR/work/$name" "$MODDIR/$name"
   local stock="/tmp/$name.orig"; [ -f "$stock" ] || stock="$live"   # apply-shell.sh's backup, if patched
-  cp "$OUT/$name" "$BR/live/new.so"; cp "$stock" "$BR/live/orig.so"
+  cp "$MODDIR/$name" "$BR/live/new.so"; cp "$stock" "$BR/live/orig.so"
   # Exports must be identical to stock. New imports are fine only if a
   # library the *stock* module already links (DT_NEEDED), taken from the
   # live system distro, exports them (name@version for versioned symbols).
@@ -132,14 +147,36 @@ fi
 [ -z "$extra" ] || echo "   $1: new imports, all provided by live libs: $(tr '\n' ' ' <<<"$extra")"
 EOF
   then
-    echo "== $name: exports identical to stock, imports OK ($(stat -c %s "$stock") -> $(stat -c %s "$OUT/$name") bytes)"
+    echo "== $name: exports identical to stock, imports OK ($(stat -c %s "$stock") -> $(stat -c %s "$MODDIR/$name") bytes)"
   else
     echo "!! $name: symbol check failed — do NOT apply" >&2; exit 1
   fi
 }
 publish rdprail-shell/rdprail-shell.so /usr/lib/weston/rdprail-shell.so
 publish libweston/backend-rdp/rdp-backend.so /usr/lib/libweston-9/rdp-backend.so
-echo "$WESTON_COMMIT" > "$OUT/weston-commit"
-echo "$WSLG_VERSION"  > "$OUT/wslg-version"
-(cd "$OUT" && sha256sum *.so)
+echo "$WESTON_COMMIT" > "$MODDIR/weston-commit"
+echo "$WSLG_VERSION"  > "$MODDIR/wslg-version"
+
+# 7. Shims: tiny, libweston-free C. They must export exactly the module entry
+#    point and import only what the live glibc provides (checked against the
+#    live libc copied into /live/needed by publish() above).
+mkdir -p "$BR/work/shim"; cp "$HERE/shim/shim.c" "$BR/work/shim/"
+chroot "$BR" bash -euo pipefail <<'EOF'
+cd /work/shim
+nm -D --defined-only /live/needed/libc.so.6 | awk 'NF==3 {print $3}' | sed 's/@@/@/' | sort -u > libc.provided
+for m in BACKEND:rdp-backend.so:weston_backend_init SHELL:rdprail-shell.so:wet_shell_init; do
+  IFS=: read -r def out entry <<<"$m"
+  gcc -shared -fPIC -O2 -Wall -Wextra -Werror -fvisibility=hidden -D_FORTIFY_SOURCE=2 \
+      -DSHIM_$def -DSHIM_MODULE="\"$out\"" -o "$out" shim.c
+  strip --strip-unneeded "$out"
+  exp="$(nm -D --defined-only "$out" | awk '{print $3}' | tr '\n' ' ')"
+  [ "$exp" = "$entry " ] || { echo "!! shim $out exports '$exp', expected '$entry'"; exit 1; }
+  for s in $(nm -D --undefined-only "$out" | awk '$1=="U" {print $2}'); do
+    grep -qxF "$s" libc.provided || { echo "!! shim $out imports $s, not in live libc"; exit 1; }
+  done
+  echo "== shim $out: exports $entry, imports only live libc"
+done
+EOF
+cp "$BR/work/shim/rdp-backend.so" "$BR/work/shim/rdprail-shell.so" "$OUT/"
+(cd "$OUT" && sha256sum *.so weston-*/*.so)
 echo "== done: $OUT"

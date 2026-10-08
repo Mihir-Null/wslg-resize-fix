@@ -73,7 +73,7 @@ case "$ACTION" in
   status) status ;;
   apply)
     if [ -z "$SRCDIR" ]; then
-      for c in /tmp/wslg-out "$HERE/out"; do
+      for c in "/tmp/wslg-out/weston-$(running_commit)" "$HERE/out"; do
         [ -f "$c/rdprail-shell.so" ] && [ -f "$c/rdp-backend.so" ] && { SRCDIR="$c"; break; }
       done
     fi
