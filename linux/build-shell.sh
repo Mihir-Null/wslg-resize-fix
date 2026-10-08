@@ -96,15 +96,22 @@ chroot "$BR" /bin/bash -euo pipefail -c "
 #    resolve via $ORIGIN once installed next to the originals).
 mkdir -p "$OUT" "$BR/live"
 publish() {  # <build-relative path> <live path>
-  local rel="$1" live="$2" name; name="$(basename "$rel")"
+  local rel="$1" live="$2" name lib d; name="$(basename "$rel")"
   chroot "$BR" strip --strip-debug "/work/weston/build/$rel" -o "/work/$name"
   cp "$BR/work/$name" "$OUT/$name"
   local stock="/tmp/$name.orig"; [ -f "$stock" ] || stock="$live"   # apply-shell.sh's backup, if patched
   cp "$OUT/$name" "$BR/live/new.so"; cp "$stock" "$BR/live/orig.so"
-  # Exports must be identical. Imports may only grow by versioned glibc
-  # symbols (the control FIFO needs mkfifo/sscanf/...); anything else new
-  # would mean we're linking against something the live distro might not have.
-  # (Runs in the build root: the system distro itself has no nm/diff.)
+  # Exports must be identical to stock. New imports are fine only if a
+  # library the *stock* module already links (DT_NEEDED), taken from the
+  # live system distro, exports them (name@version for versioned symbols).
+  # So we can never depend on a library or symbol version WSLg doesn't ship.
+  rm -rf "$BR/live/needed"; mkdir -p "$BR/live/needed"
+  for lib in $(chroot "$BR" readelf -d /live/orig.so | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+    for d in "$(dirname "$live")" /usr/lib /usr/lib64 /lib64; do
+      [ -e "$d/$lib" ] && { cp -L "$d/$lib" "$BR/live/needed/"; break; }
+    done
+  done
+  # (Runs in the build root: the system distro itself has no nm/readelf.)
   if chroot "$BR" bash -euo pipefail -s "$name" <<'EOF'
 cd /live
 for f in new orig; do
@@ -116,10 +123,13 @@ if [ "$(comm -3 orig.def new.def)" ]; then
 fi
 gone="$(comm -23 orig.und new.und | tr '\n' ' ')"; [ -z "$gone" ] || echo "   $1: no longer imports: $gone"
 extra="$(comm -13 orig.und new.und)"
-if [ "$(grep -v '@GLIBC_' <<<"$extra" || true)" ]; then
-  echo "!! $1: new non-glibc imports:"; grep -v '@GLIBC_' <<<"$extra"; exit 1
+nm -D --defined-only needed/* 2>/dev/null | awk 'NF==3 {print $3}' | sed 's/@@/@/' | sort -u > provided
+missing=""
+for s in $extra; do grep -qxF "$s" provided || missing="$missing $s"; done
+if [ -n "$missing" ]; then
+  echo "!! $1: new imports not provided by the live libraries it links ($(ls needed | tr '\n' ' ')):$missing"; exit 1
 fi
-[ -z "$extra" ] || echo "   $1: new glibc imports: $(tr '\n' ' ' <<<"$extra")"
+[ -z "$extra" ] || echo "   $1: new imports, all provided by live libs: $(tr '\n' ' ' <<<"$extra")"
 EOF
   then
     echo "== $name: exports identical to stock, imports OK ($(stat -c %s "$stock") -> $(stat -c %s "$OUT/$name") bytes)"

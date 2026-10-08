@@ -41,7 +41,7 @@ system distro.
 
 | piece | where | what |
 |---|---|---|
-| `patches/0001-…patch` | Weston `rdprail-shell.so` | implement the TODO: same size conversion + min/max clamp as the snap path, skip maximized/fullscreen |
+| `patches/0001-…patch` | Weston `rdprail-shell.so` | implement the TODO: same size conversion + min/max clamp as the snap path, skip maximized/fullscreen; when a request also resizes, apply the new position only once the app commits its resized buffer (250 ms fallback), so msrdc never gets "new position, old size" and the window doesn't flash back |
 | `patches/0002-…patch` | Weston `rdp-backend.so` | a control FIFO `$XDG_RUNTIME_DIR/wslg-window-ctl`; each `move <id-hex> <l> <t> <r> <b>` line is fed to the **unmodified** Client Window Move handler, so coordinate translation, margins and shadows are exactly as for a real PDU |
 | `helper/` (`wslg-resize-sync.exe`) | Windows | watch msrdc's `RAIL_WINDOW`s, and when something other than msrdc/Weston moved one, write its rect to the FIFO |
 
@@ -51,8 +51,10 @@ system distro.
   user (uid 1000), inside a runtime dir only uid 1000 can reach. On a
   default install that is exactly the user who can already drive WSLg.
 * **No protocol / struct changes.** All new state in the backend is
-  file-static; exports are byte-identical to stock and the only new imports
-  are glibc (`build-shell.sh` checks this before publishing).
+  file-static; exports are identical to stock, and every new import must be
+  exported (name and symbol version) by a library the *stock* module already
+  links, as found in the live system distro. `build-shell.sh` refuses to
+  publish otherwise.
 * **Survives Weston restarts.** Weston opens the FIFO `O_RDWR` (never sees
   EOF) and reuses an existing one; a writer that outlives a Weston gets
   `EPIPE` and the helper respawns its relay.
