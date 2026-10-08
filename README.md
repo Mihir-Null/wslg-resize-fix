@@ -188,6 +188,12 @@ echo 'move a 100 100 1100 800' > /mnt/wslg/runtime-dir/wslg-window-ctl
 grep 'wslg ctl' /mnt/wslg/weston.log
 ```
 
+## Credits
+
+Investigation, patches and tooling were developed with the assistance of
+Claude (Anthropic's AI assistant) and tested on real hardware as described
+above.
+
 ## License
 
 MIT (see [LICENSE](LICENSE)); the patches modify MIT-licensed
