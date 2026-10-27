@@ -8,7 +8,8 @@
     1. clone/fetch jcardama/LeopardWM into %LOCALAPPDATA%\wslg-resize-fix\LeopardWM
     2. check out the tag matching the installed leopardwm.exe version (or -Version)
     3. apply leopardwm-allow-rail.patch (tile WSLg top-level windows, i.e. RAIL_WINDOWs
-     titled "<title> (<distro>)"; WSLg popups/menus/tooltips stay untiled), cargo build --release
+     titled "<title> (<distro>)"; WSLg popups/menus/tooltips stay untiled), 3-way if it
+     doesn't apply as-is; check every class-skip call site got the guard; cargo build --release
     4. stop LeopardWM, then (elevated, one UAC prompt) move the original
        leopardwm.exe / leopardwm-watchdog.exe / leopardwm-cli.exe / lwm.exe into
        <install>\bin\unpatched-<version>\ and copy the patched ones in
@@ -49,6 +50,7 @@ $Src = Join-Path $Work 'LeopardWM'
 $Exes = 'leopardwm.exe', 'leopardwm-watchdog.exe', 'leopardwm-cli.exe', 'lwm.exe'
 $Bin = Join-Path $InstallDir 'bin'
 $Marker = Join-Path $Bin 'wslg-resize-fix.patched'    # records what we installed
+$PatchFor = '0.3.4'                                   # LeopardWM release leopardwm-allow-rail.patch was made against (applies back to 0.2.13)
 
 # --- elevated half: only file moves/copies inside the install dir ----------------
 if ($Elevated) {
@@ -79,7 +81,25 @@ function Hash([string]$Path) {
   try { $f = [IO.File]::OpenRead($Path); try { [BitConverter]::ToString($sha.ComputeHash($f)) } finally { $f.Dispose() } }
   finally { $sha.Dispose() }
 }
+# A patch can apply and still miss a class-skip call site LeopardWM added since, which would
+# quietly keep skipping WSLg windows there. So after applying, every non-test call must carry
+# the WSLg guard on its own line (the patch keeps each guarded call on one line for this).
+function Assert-ClassSkipsGuarded([string]$Root) {
+  $bad = Get-ChildItem (Join-Path $Root 'crates') -Recurse -Filter *.rs |
+    Select-String -Pattern 'should_skip_window_by_class\(' |
+    Where-Object { $_.Line -notmatch 'fn should_skip_window_by_class|should_skip_window_by_class\("|is_wslg_toplevel' }
+  if ($bad) {
+    $sites = ($bad | ForEach-Object { "  $($_.Path.Substring($Root.Length + 1)):$($_.LineNumber): $($_.Line.Trim())" }) -join "`n"
+    throw "call sites of should_skip_window_by_class without the WSLg guard (LeopardWM added them; update the patch):`n$sites"
+  }
+}
 function Installed-Version { (Get-Item (Join-Path $Bin 'leopardwm.exe')).VersionInfo.ProductVersion.Trim() }
+# Version we patched, or $null. A LeopardWM update replaces the binaries but leaves the
+# marker behind, so it only counts while it names the installed version.
+function Patched-Version {
+  if (-not (Test-Path $Marker)) { return $null }
+  (Get-Content $Marker) -replace '^patched LeopardWM (\S+) .*$', '$1'
+}
 function Stop-LeopardWM {
   $p = Get-Process leopardwm, leopardwm-watchdog -ErrorAction SilentlyContinue
   if (-not $p) { return }
@@ -108,15 +128,20 @@ function Invoke-Elevated([string]$Mode, [string]$FromDir, [string]$Ver) {
 }
 
 if ($Status) {
-  "installed: LeopardWM $(Installed-Version) in $Bin"
-  if (Test-Path $Marker) { "patched:   " + (Get-Content $Marker) } else { 'patched:   no (stock binaries)' }
+  $iv = Installed-Version; $pv = Patched-Version
+  "installed: LeopardWM $iv in $Bin"
+  if (-not $pv) { 'patched:   no (stock binaries)' }
+  elseif ($pv -ne $iv) { "patched:   no (stock binaries; LeopardWM was updated since $pv was patched: run this script again)" }
+  else { "patched:   " + (Get-Content $Marker) }
   Get-Process leopardwm -ErrorAction SilentlyContinue | % { "running:   pid $($_.Id) $($_.Path)" }
   return
 }
 
 if ($Revert) {
-  if (-not (Test-Path $Marker)) { Write-Host 'not patched; nothing to revert'; return }
-  $v = ((Get-Content $Marker) -replace '^patched LeopardWM (\S+) .*$', '$1')
+  $v = Patched-Version
+  if (-not $v) { Write-Host 'not patched; nothing to revert'; return }
+  # Restoring the older originals over an updated install would downgrade LeopardWM.
+  if ($v -ne (Installed-Version)) { Write-Host "LeopardWM $(Installed-Version) is stock (updated since $v was patched); nothing to revert"; return }
   Stop-LeopardWM
   Write-Host "== restoring original LeopardWM $v binaries (UAC prompt)"
   Invoke-Elevated 'revert' '' $v
@@ -135,10 +160,23 @@ $patch = Join-Path $PSScriptRoot 'leopardwm-allow-rail.patch'
 Write-Host "== LeopardWM $tag + $(Split-Path $patch -Leaf)"
 if (-not (Test-Path (Join-Path $Src '.git'))) { git clone -q $Repo $Src; if ($LASTEXITCODE) { throw 'git clone failed' } }
 git -C $Src fetch -q --tags origin; if ($LASTEXITCODE) { throw 'git fetch failed' }
+# reset + clean: a previous run's wslg_toplevel.rs (untracked, or staged by apply -3) would block apply.
+# Not -x, so target\ stays and rebuilds are incremental.
+git -C $Src reset -q --hard; git -C $Src clean -fdq
 git -C $Src checkout -q --force $tag; if ($LASTEXITCODE) { throw "no tag $tag upstream" }
 git -C $Src apply --check $patch 2>$null
-if ($LASTEXITCODE) { throw "patch does not apply to $tag; LeopardWM changed enumeration.rs, update the patch" }
-git -C $Src apply $patch
+if ($LASTEXITCODE) {
+  # Context moved more than a plain apply tolerates: merge against the blobs the patch was made from.
+  Write-Host "   patch does not apply as-is to $tag; trying a 3-way merge"
+  git -C $Src apply -3 $patch
+  if ($LASTEXITCODE) {
+    git -C $Src reset -q --hard; git -C $Src clean -fdq
+    throw "patch does not apply to $tag, even 3-way (made against LeopardWM $PatchFor); update the patch"
+  }
+} else {
+  git -C $Src apply $patch
+}
+Assert-ClassSkipsGuarded $Src
 Push-Location $Src
 try { cargo build --release; if ($LASTEXITCODE) { throw 'cargo build failed' } } finally { Pop-Location }
 $out = Join-Path $Src 'target\x86_64-pc-windows-msvc\release'

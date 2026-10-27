@@ -15,6 +15,8 @@
       westonSources = {
         # WSLg 1.0.73.2 (WSL 2.7.x)
         "04d436c7d9a0cd55fa64b6612c7fa678d6fcd077" = "sha256-EP0c50DCaQ5ZiIqNBzfLfuD3pPX9A7Iu8kGv1iFkkIk=";
+        # WSLg 1.0.79 (WSL 3.0.x)
+        "a7e35fdab455dce5774b43b8aff682f748307e31" = "sha256-XCmHRQDU5SRr6G1c+KFUUUzGVhVuWYGdWIRccU9tHkg=";
       };
       westonSrc = rev: hash: pkgs.fetchFromGitHub {
         owner = "microsoft";

@@ -10,7 +10,10 @@ The same happens with a plain keyboard resize (Alt+Space → Size) on stock WSLg
 
 Verified on WSL 2.7.14 / WSLg 1.0.73.2 (weston-mirror `04d436c7`), MSRDC
 1.2.7214, Windows 11, with X11 (xterm) and Wayland (pgtk Emacs) clients under
-LeopardWM.
+LeopardWM. The patches apply unchanged to WSLg 1.0.79 (WSL 3.0.x, weston-mirror
+`a7e35fda`), whose only weston change is the backend also clipping the shadow of
+maximized/fullscreen windows; that build is pinned in the flake but not yet
+tested on hardware.
 
 ## Why it breaks
 
@@ -221,7 +224,16 @@ helper, used to crash Weston; see below).
 It replaces the binaries in place (originals kept in `bin\unpatched-<version>`)
 because `lwm start`/`restart` launch the daemon from the CLI's own folder, which
 is on the machine `PATH`. A LeopardWM update brings back unpatched binaries:
-run it again.
+run it again (`-Status` then says so, and `-Revert` refuses to put older
+originals over the update).
+
+The patch is made against LeopardWM 0.3.4 and applies to every release back to
+0.2.13. To keep it applying as LeopardWM changes, the helpers and their test live
+in a new file (`wslg_toplevel.rs`), and each class-skip call site changes on one
+line. If plain `git apply` fails, the script retries with a 3-way merge. After
+applying, it fails the build if any `should_skip_window_by_class(` call outside
+tests lacks the WSLg guard, so a call site LeopardWM adds later can't quietly
+keep skipping WSLg windows.
 
 ## Known issues
 
