@@ -1,5 +1,5 @@
 diff --git a/crates/platform_win32/src/enumeration.rs b/crates/platform_win32/src/enumeration.rs
-index 9720037..e0ece35 100644
+index 5f5ff7d..4859920 100644
 --- a/crates/platform_win32/src/enumeration.rs
 +++ b/crates/platform_win32/src/enumeration.rs
 @@ -70,7 +70,9 @@ pub fn is_excluded_topmost_popup_hwnd(hwnd: WindowId) -> bool {
@@ -8,56 +8,102 @@ index 9720037..e0ece35 100644
      let class_len = unsafe { GetClassNameW(HWND(hwnd as *mut c_void), &mut class_buf) };
 -    should_skip_window_by_class(&String::from_utf16_lossy(&class_buf[..class_len as usize]))
 +    let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
-+    should_skip_window_by_class(&class_name)
-+        && !is_wslg_toplevel(&class_name, &window_title(HWND(hwnd as *mut c_void)))
++    let hwnd = HWND(hwnd as *mut c_void);
++    should_skip_window_by_class(&class_name) && !crate::wslg_toplevel::is_wslg_toplevel_hwnd(&class_name, hwnd)
  }
  
  /// Get info for a single window handle with relaxed filters.
-@@ -129,7 +131,7 @@ pub fn get_window_info(hwnd_id: WindowId) -> Option<WindowInfo> {
+@@ -127,7 +129,7 @@ pub fn get_window_info(hwnd_id: WindowId) -> Option<WindowInfo> {
              String::new()
          };
  
 -        if should_skip_window_by_class(&class_name) {
-+        if should_skip_window_by_class(&class_name) && !is_wslg_toplevel(&class_name, &title) {
++        if should_skip_window_by_class(&class_name) && !crate::wslg_toplevel::is_wslg_toplevel_hwnd(&class_name, hwnd) {
              return None;
          }
  
-@@ -470,7 +472,7 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
+@@ -450,7 +452,7 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
          String::new()
      };
  
 -    if should_skip_window_by_class(&class_name) {
-+    if should_skip_window_by_class(&class_name) && !is_wslg_toplevel(&class_name, &title) {
++    if should_skip_window_by_class(&class_name) && !crate::wslg_toplevel::is_wslg_toplevel_hwnd(&class_name, hwnd) {
          return TRUE;
      }
  
-@@ -582,7 +584,9 @@ pub(crate) fn should_emit_window_event_with_policy(
+@@ -561,7 +563,7 @@ pub(crate) fn should_emit_window_event_with_policy(
          String::new()
      };
  
 -    if should_skip_window_by_class(&class_name) {
-+    if should_skip_window_by_class(&class_name)
-+        && !is_wslg_toplevel(&class_name, &window_title(hwnd))
-+    {
++    if should_skip_window_by_class(&class_name) && !crate::wslg_toplevel::is_wslg_toplevel_hwnd(&class_name, hwnd) {
          return false;
      }
  
-@@ -696,6 +700,27 @@ fn should_treat_cloak_query_failure_as_cloaked(window_is_valid: bool) -> bool {
-     !window_is_valid
- }
+diff --git a/crates/platform_win32/src/inspect.rs b/crates/platform_win32/src/inspect.rs
+index fbf72d5..83c1f88 100644
+--- a/crates/platform_win32/src/inspect.rs
++++ b/crates/platform_win32/src/inspect.rs
+@@ -133,7 +133,7 @@ fn classify_startup(hwnd: HWND) -> Result<(), SkipReason> {
+         return Err(SkipReason::SkipTitle);
+     }
+     let class_name = read_class_name(hwnd);
+-    if should_skip_window_by_class(&class_name) {
++    if should_skip_window_by_class(&class_name) && !crate::wslg_toplevel::is_wslg_toplevel_hwnd(&class_name, hwnd) {
+         return Err(SkipReason::SkipClass);
+     }
+     let _ = read_rect(hwnd)?;
+@@ -174,7 +174,7 @@ fn classify_live_create(hwnd: HWND) -> Result<(), SkipReason> {
+     // require_title=false: empty/skip title allowed.
  
-+/// Local patch (wslg-resize-fix): WSLg windows (msrdc.exe `RAIL_WINDOW`) stay
-+/// excluded by class, except top-level ones, which WSLg titles
-+/// "<title> (<distro>)". WSLg popups, menus and tooltips are untitled
-+/// `RAIL_WINDOW`s with identical styles, so the title is what tells them apart.
-+/// For the Linux app to follow a tiled size, WSLg needs
-+/// https://github.com/Mihir-Null/wslg-resize-fix.
+     let class_name = read_class_name(hwnd);
+-    if should_skip_window_by_class(&class_name) {
++    if should_skip_window_by_class(&class_name) && !crate::wslg_toplevel::is_wslg_toplevel_hwnd(&class_name, hwnd) {
+         return Err(SkipReason::SkipClass);
+     }
+ 
+diff --git a/crates/platform_win32/src/lib.rs b/crates/platform_win32/src/lib.rs
+index e250b30..947c383 100644
+--- a/crates/platform_win32/src/lib.rs
++++ b/crates/platform_win32/src/lib.rs
+@@ -45,6 +45,7 @@ mod visibility;
+ mod window_identity;
+ mod window_query;
+ mod window_style;
++mod wslg_toplevel; // local patch (wslg-resize-fix)
+ 
+ pub use gestures::*;
+ pub use hotkeys::*;
+diff --git a/crates/platform_win32/src/wslg_toplevel.rs b/crates/platform_win32/src/wslg_toplevel.rs
+new file mode 100644
+index 0000000..621d4b3
+--- /dev/null
++++ b/crates/platform_win32/src/wslg_toplevel.rs
+@@ -0,0 +1,54 @@
++//! Local patch (wslg-resize-fix): WSLg windows (msrdc.exe `RAIL_WINDOW`) stay
++//! excluded by class, except top-level ones, which WSLg titles
++//! "<title> (<distro>)". WSLg popups, menus and tooltips are untitled
++//! `RAIL_WINDOW`s with identical styles, so the title is what tells them apart.
++//! For the Linux app to follow a tiled size, WSLg needs
++//! https://github.com/Mihir-Null/wslg-resize-fix.
++//!
++//! Kept in its own file so the patch touches upstream code only at the
++//! `should_skip_window_by_class` call sites (one line each).
++
++use windows::Win32::Foundation::HWND;
++use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
++
 +pub(crate) fn is_wslg_toplevel(class_name: &str, title: &str) -> bool {
 +    class_name == "RAIL_WINDOW" && title.ends_with(')') && title.contains(" (")
 +}
 +
++/// `is_wslg_toplevel` for call sites that have no title at hand.
++pub(crate) fn is_wslg_toplevel_hwnd(class_name: &str, hwnd: HWND) -> bool {
++    class_name == "RAIL_WINDOW" && is_wslg_toplevel(class_name, &window_title(hwnd))
++}
++
 +/// Window title, or empty.
-+pub(crate) fn window_title(hwnd: HWND) -> String {
++fn window_title(hwnd: HWND) -> String {
 +    let len = unsafe { GetWindowTextLengthW(hwnd) };
 +    if len <= 0 {
 +        return String::new();
@@ -67,17 +113,10 @@ index 9720037..e0ece35 100644
 +    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 +}
 +
- /// Check if a window should be skipped based on its class name.
- pub(crate) fn should_skip_window_by_class(class_name: &str) -> bool {
-     const SKIP_CLASSES: &[&str] = &[
-@@ -1111,3 +1136,24 @@ mod tests {
-         assert!(!should_skip_window_by_class("IMEWindow"));
-     }
- }
-+
 +#[cfg(test)]
-+mod wslg_toplevel_tests {
-+    use super::{is_wslg_toplevel, should_skip_window_by_class};
++mod tests {
++    use super::is_wslg_toplevel;
++    use crate::enumeration::should_skip_window_by_class;
 +
 +    #[test]
 +    fn rail_windows_are_admitted_only_with_the_wslg_distro_suffix() {
@@ -95,38 +134,3 @@ index 9720037..e0ece35 100644
 +        assert!(!is_wslg_toplevel("Chrome_WidgetWin_1", "page (site)"));
 +    }
 +}
-diff --git a/crates/platform_win32/src/inspect.rs b/crates/platform_win32/src/inspect.rs
-index e9415e7..24d3af9 100644
---- a/crates/platform_win32/src/inspect.rs
-+++ b/crates/platform_win32/src/inspect.rs
-@@ -13,8 +13,8 @@
- //! because the classifiers require a live HWND.
- 
- use crate::enumeration::{
--    is_excluded_tool_window, is_excluded_topmost_popup, is_window_cloaked,
--    should_skip_window_by_class, should_skip_window_by_title,
-+    is_excluded_tool_window, is_excluded_topmost_popup, is_window_cloaked, is_wslg_toplevel,
-+    should_skip_window_by_class, should_skip_window_by_title, window_title,
- };
- use leopardwm_core_layout::{Rect, WindowId};
- use windows::core::BOOL;
-@@ -137,7 +137,7 @@ fn classify_startup(hwnd: HWND) -> Result<(), SkipReason> {
-         return Err(SkipReason::SkipTitle);
-     }
-     let class_name = read_class_name(hwnd);
--    if should_skip_window_by_class(&class_name) {
-+    if should_skip_window_by_class(&class_name) && !is_wslg_toplevel(&class_name, &title) {
-         return Err(SkipReason::SkipClass);
-     }
-     let _ = read_rect(hwnd)?;
-@@ -184,7 +184,9 @@ fn classify_live_create(hwnd: HWND) -> Result<(), SkipReason> {
-     // require_title=false: empty/skip title allowed.
- 
-     let class_name = read_class_name(hwnd);
--    if should_skip_window_by_class(&class_name) {
-+    if should_skip_window_by_class(&class_name)
-+        && !is_wslg_toplevel(&class_name, &window_title(hwnd))
-+    {
-         return Err(SkipReason::SkipClass);
-     }
- 
