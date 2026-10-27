@@ -10,10 +10,10 @@ The same happens with a plain keyboard resize (Alt+Space → Size) on stock WSLg
 
 Verified on WSL 2.7.14 / WSLg 1.0.73.2 (weston-mirror `04d436c7`), MSRDC
 1.2.7214, Windows 11, with X11 (xterm) and Wayland (pgtk Emacs) clients under
-LeopardWM. The patches apply unchanged to WSLg 1.0.79 (WSL 3.0.x, weston-mirror
-`a7e35fda`), whose only weston change is the backend also clipping the shadow of
-maximized/fullscreen windows; that build is pinned in the flake but not yet
-tested on hardware.
+LeopardWM. Also verified on WSL 3.0.3 / WSLg 1.0.79 (weston-mirror `a7e35fda`),
+MSRDC 1.2.7391, with an X11 client (xterm) tiled by LeopardWM 0.3.4; the patches
+apply to it unchanged (its only weston change is the backend also clipping the
+shadow of maximized/fullscreen windows).
 
 ## Why it breaks
 
